@@ -37,6 +37,15 @@ CREATE TABLE IF NOT EXISTS house_sessions (
   entry_snapshot TEXT,
   exit_snapshot TEXT
 );
+CREATE TABLE IF NOT EXISTS known_people (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  crop_path TEXT,
+  hist BLOB,
+  source_event_id INTEGER,
+  created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp_start);
 CREATE INDEX IF NOT EXISTS idx_sessions_entry ON house_sessions(entry_time);
 """
@@ -58,6 +67,15 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Migrações simples de schema (idempotentes)."""
+        try:
+            self._conn.execute("ALTER TABLE events ADD COLUMN person_label TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # coluna já existe
 
     # ---------- eventos ----------
     def add_event(self, event_type: str, track_id: Optional[int], zone: Optional[str],
@@ -139,6 +157,37 @@ class Store:
             (ts_from, ts_to))
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    # ---------- pessoas conhecidas ----------
+    def add_known_person(self, name: str, description: str, crop_path: str,
+                         hist: bytes, source_event_id: Optional[int] = None) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO known_people (name, description, crop_path, hist, source_event_id, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (name, description, crop_path, hist, source_event_id, _now_iso()))
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def known_people(self) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT id, name, description, crop_path, hist, source_event_id, created_at"
+            " FROM known_people ORDER BY name")
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def event_by_id(self, event_id: int) -> Optional[dict]:
+        cur = self._conn.execute(
+            "SELECT id, timestamp_start, event_type, track_id, zone, vlm_description,"
+            " risk_level, snapshot_path, meta, person_label FROM events WHERE id=?", (event_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [c[0] for c in cur.description]
+        return dict(zip(cols, row))
+
+    def set_event_person_label(self, event_id: int, label: str) -> None:
+        self._conn.execute("UPDATE events SET person_label=? WHERE id=?", (label, event_id))
+        self._conn.commit()
 
     # ---------- manutenção ----------
     def purge_older_than(self, days: int) -> int:

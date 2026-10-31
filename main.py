@@ -95,6 +95,47 @@ def generate_report_now(send: bool = True) -> int:
     return 0
 
 
+def identify_person(event_id: int, name: str) -> int:
+    """Registra a identidade da pessoa de um evento (quando o usuário responde)."""
+    from pathlib import Path
+
+    from db.store import Store
+    from events.identity import crop_hist
+
+    store = Store()
+    ev = store.event_by_id(event_id)
+    if not ev:
+        log.error("evento #%d não encontrado", event_id)
+        return 1
+    if not ev.get("snapshot_path") or not Path(ev["snapshot_path"]).exists():
+        log.error("evento #%d sem snapshot válido", event_id)
+        return 1
+    hist = crop_hist(Path(ev["snapshot_path"]))
+    if hist is None:
+        log.error("não consegui extrair a aparência do snapshot")
+        return 1
+    desc = (ev.get("vlm_description") or "")[:200]
+    pid = store.add_known_person(name, desc, ev["snapshot_path"], hist.tobytes(),
+                                 source_event_id=event_id)
+    store.set_event_person_label(event_id, name)
+    log.info("pessoa registrada: #%d %s (evento #%d) — eventos futuros parecidos sairão identificados",
+             pid, name, event_id)
+    return 0
+
+
+def list_people() -> int:
+    from db.store import Store
+
+    people = Store().known_people()
+    if not people:
+        print("nenhuma pessoa registrada ainda")
+        return 0
+    for p in people:
+        print(f"#{p['id']} {p['name']} — {p['description'] or '(sem descrição)'} "
+              f"[evento origem #{p['source_event_id']}]")
+    return 0
+
+
 def run_daemon() -> int:
     """Daemon 24/7: pipeline contínuo + relatório às 22h00 + manutenção 23h00."""
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -133,6 +174,9 @@ def main() -> int:
     parser.add_argument("--save-every", type=int, default=25, help="salva 1 JPEG a cada N frames (0=não salva)")
     parser.add_argument("--generate-report-now", action="store_true", help="gera e envia o relatório agora")
     parser.add_argument("--no-send", action="store_true", help="com --generate-report-now: só gera, não envia")
+    parser.add_argument("--identify-person", nargs=2, metavar=("EVENTO_ID", "NOME"),
+                        help="registra a identidade da pessoa de um evento")
+    parser.add_argument("--list-people", action="store_true", help="lista pessoas registradas")
     parser.add_argument("--run", action="store_true", help="roda o daemon 24/7")
     args = parser.parse_args()
 
@@ -142,6 +186,10 @@ def main() -> int:
         return detect_test(args.seconds)
     if args.generate_report_now:
         return generate_report_now(send=not args.no_send)
+    if args.identify_person:
+        return identify_person(int(args.identify_person[0]), args.identify_person[1])
+    if args.list_people:
+        return list_people()
     if args.run:
         return run_daemon()
 

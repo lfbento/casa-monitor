@@ -66,6 +66,32 @@ def send_telegram(text: str) -> bool:
     return ok
 
 
+def send_photo(image_path: str, caption: str) -> bool:
+    """Envia UMA foto com legenda (alerta de evento). Telegram: sendPhoto."""
+    from pathlib import Path
+
+    p = Path(image_path)
+    if not p.exists():
+        logger.error("foto não existe: %s", image_path)
+        return send(caption)
+    if CHANNEL == "telegram" and TELEGRAM_TOKEN and TELEGRAM_CHAT:
+        try:
+            with p.open("rb") as fh:
+                resp = httpx.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                    data={"chat_id": TELEGRAM_CHAT, "caption": caption[:1000]},
+                    files={"photo": (p.name, fh, "image/jpeg")},
+                    timeout=60,
+                )
+            if resp.status_code == 200:
+                return True
+            logger.error("sendPhoto HTTP %s: %s", resp.status_code, resp.text[:200])
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.error("sendPhoto falhou: %s", err)
+    # fallback: texto (com o caminho da foto)
+    return send(f"{caption}\n\n📷 {image_path}")
+
+
 def send_whatsapp_evolution(text: str) -> bool:
     if not (WA_URL and WA_KEY and WA_INSTANCE):
         logger.error("WHATSAPP_EVOLUTION_* não configurados")

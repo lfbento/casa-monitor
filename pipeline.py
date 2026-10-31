@@ -48,7 +48,12 @@ class MonitorPipeline:
             pass
 
     async def _vlm_worker(self) -> None:
+        from events.identity import crop_hist, match
+        from notifier import send_photo
         from vlm.describe import describe_event
+
+        # eventos que viram alerta imediato no Telegram (foto + análise)
+        ALERT_TYPES = {"aproximacao_portao", "alerta_suspeito"}
 
         while True:
             event_id, event_type, snapshot = await self._vlm_queue.get()
@@ -60,9 +65,31 @@ class MonitorPipeline:
                 logger.warning("limite de VLM/hora atingido — evento %d sem descrição", event_id)
                 continue
             result = await asyncio.to_thread(describe_event, event_type, [snapshot])
+            descricao = None
             if result:
-                risk = result.risk_level
-                self.store.set_vlm_description(event_id, result.descricao, risk)
+                descricao = result.descricao
+                self.store.set_vlm_description(event_id, result.descricao, result.risk_level)
+
+            # identidade: parecia com alguém conhecido?
+            hist = await asyncio.to_thread(crop_hist, snapshot)
+            m = match(hist, self.store.known_people())
+            quem = f"{m.name} (conhecido, {m.score:.0%})" if m else "pessoa desconhecida"
+            if m:
+                self.store.set_event_person_label(event_id, m.name)
+
+            if event_type in ALERT_TYPES:
+                ev = self.store.event_by_id(event_id) or {}
+                titulo = ("🔔 Pessoa com interesse no portão" if event_type == "aproximacao_portao"
+                          else "⚠️ Comportamento atípico")
+                caption = (
+                    f"{titulo} — evento #{event_id}\n"
+                    f"Horário: {ev.get('timestamp_start', '?')} | Zona: {ev.get('zone', '?')}\n"
+                    f"Quem: {quem}\n"
+                    f"Análise: {descricao or '(sem VLM)'}\n\n"
+                    f"Se você conhece, responda: é #{event_id} <nome> — para registrar."
+                )
+                await asyncio.to_thread(send_photo, str(snapshot), caption)
+                logger.info("alerta enviado: evento #%d (%s)", event_id, quem)
 
     # ------------------------------------------------------------- manutenção
     def maintenance(self) -> None:

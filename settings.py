@@ -53,7 +53,7 @@ class DetectConfig:
 class RulesConfig:
     loitering_seconds: int = field(default_factory=lambda: _int("LOITERING_SECONDS", 30))
     vehicle_stop_seconds: int = field(default_factory=lambda: _int("VEHICLE_STOP_SECONDS", 20))
-    gate_dwell_seconds: int = field(default_factory=lambda: _int("GATE_DWELL_SECONDS", 8))
+    gate_dwell_seconds: int = field(default_factory=lambda: _int("GATE_DWELL_SECONDS", 5))
     night_window: str = field(default_factory=lambda: os.getenv("NIGHT_WINDOW", "00:00-05:30"))
     snapshot_retention_days: int = field(default_factory=lambda: _int("SNAPSHOT_RETENTION_DAYS", 7))
 
