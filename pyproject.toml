@@ -1,0 +1,26 @@
+[project]
+name = "casa-monitor"
+version = "0.1.0"
+description = "Monitoramento inteligente por visão computacional (CW700S) + relatório diário 22h00"
+requires-python = ">=3.12"
+dependencies = [
+    "av>=13.0",
+    "numpy>=1.26",
+    "httpx>=0.27",
+    "websockets>=14.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "pillow>=10.0",
+    "apscheduler>=3.10",
+    "pyjwt>=2.8",
+]
+
+[dependency-groups]
+# Camada 1 (detecção) — instalar com: uv sync --group detect
+detect = [
+    "ultralytics>=8.3",
+    "opencv-python>=4.10",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,29 @@
+# Zonas de monitoramento — calibradas em 2026-10-31 (CW700S, 1280x720, olho-de-peixe)
+# Gerado por zones/calibrate_zones.py --grid + leitura visual. Ajuste com --click.
+image_size: [1280, 720]
+zones:
+  ZONA_RUA:
+    - [256, 0]
+    - [1024, 86]
+    - [1280, 360]
+    - [1280, 720]
+    - [656, 720]
+    - [512, 425]
+    - [320, 110]
+  ZONA_PORTAO:
+    - [0, 110]
+    - [180, 190]
+    - [560, 720]
+    - [320, 720]
+    - [0, 720]
+  ZONA_INTERNA:
+    - [0, 0]
+    - [240, 0]
+    - [200, 120]
+    - [60, 160]
+    - [0, 130]
+  LINHA_ACESSO_CASA:
+    - [240, 280]
+    - [80, 380]
+# lado de DENTRO da casa (cruzar a linha terminando nesse lado = ENTRY)
+house_side: [60, 200]
