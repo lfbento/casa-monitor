@@ -23,7 +23,7 @@ import numpy as np
 from db.store import Store
 from detect.tracker import TrackBook, TrackState
 from detect.yolo_engine import ANIMAL_CLASSES, VEHICLE_CLASSES, Detection
-from settings import RulesConfig
+from settings import PipelineLimits, RulesConfig
 from events.identity import MATCH_MARGIN, MATCH_THRESHOLD
 from zones.roi import Zones
 
@@ -34,6 +34,8 @@ SPEED_SLOW = 25.0        # px/s — loitering: andar devagar/oscilar
 VEHICLE_NEAR_MARGIN = 40  # px de margem ao redor do bbox do veículo
 
 ALERT_TAGS = {"acesso_casa", "aproximacao_portao", "alerta_suspeito"}
+
+_UNSET = object()  # distingue "usa o instante atual" de "captura desconhecida"
 
 
 class EventImages(NamedTuple):
@@ -49,15 +51,26 @@ def _now_iso() -> str:
 class EventEngine:
     def __init__(self, zones: Zones, rules: RulesConfig, store: Store,
                  snapshot_dir: Path,
-                 on_event: Optional[Callable[[int, str, EventImages], None]] = None):
+                 on_event: Optional[Callable[[int, str, EventImages], None]] = None,
+                 limits: Optional[PipelineLimits] = None):
         self.zones = zones
         self.rules = rules
         self.store = store
         self.snapshot_dir = snapshot_dir
         self.on_event = on_event  # (event_id, event_type, EventImages) → fila VLM/alerta
+        self.limits = limits or PipelineLimits()
         self.book = TrackBook()
+        # episódios de passagem aguardando a janela de agregação (fragmentos)
+        self._pending_passages: list[dict] = []
         # instante em que o frame do step atual foi observado (horário de parede)
         self._observed_at: Optional[datetime] = None
+        # instante gravado no frame (OSD); None = idade de captura desconhecida
+        self._captured_at: Optional[datetime] = None
+
+    def reset(self) -> None:
+        """Descarta tracks e episódios pendentes (usado ao reconectar o stream)."""
+        self.book = TrackBook()
+        self._pending_passages.clear()
 
     # ------------------------------------------------------------------ utils
     def _is_night(self, now: Optional[datetime] = None) -> bool:
@@ -158,8 +171,10 @@ class EventEngine:
 
     def _emit(self, event_type: str, st: TrackState, zone: Optional[str],
               frame: np.ndarray, risk: str = "baixo", ts_end: Optional[str] = None,
-              meta: Optional[dict] = None) -> int:
-        observed = self._observed_at or datetime.now().astimezone()
+              meta: Optional[dict] = None,
+              observed_override: Optional[datetime] = None,
+              captured_override: object = _UNSET) -> int:
+        observed = observed_override or self._observed_at or datetime.now().astimezone()
         latency_ms = max(0, int((datetime.now().astimezone() - observed).total_seconds() * 1000))
         area = 0.0
         if st.bboxes:
@@ -172,7 +187,13 @@ class EventEngine:
             "conf": round(float(st.last_conf), 3),
             "track": st.track_id,
         })
-        ts_start = self._obs_iso()
+        ts_start = observed.isoformat(timespec="seconds")
+        captured = self._captured_at if captured_override is _UNSET else captured_override
+        captured_iso = captured.isoformat(timespec="seconds") if captured else None
+        capture_age_ms = None
+        if captured is not None:
+            ref = datetime.now(captured.tzinfo) if captured.tzinfo else datetime.now()
+            capture_age_ms = max(0, int((ref - captured).total_seconds() * 1000))
         imgs = self._save_snapshot(frame, st, event_type)
         eid = self.store.add_event(
             event_type=event_type, track_id=st.track_id, zone=zone,
@@ -180,6 +201,7 @@ class EventEngine:
             snapshot_path=imgs.context, person_crop_path=imgs.person_crop,
             meta=json.dumps(payload, ensure_ascii=False),
             observed_at=ts_start, detect_latency_ms=latency_ms,
+            captured_at=captured_iso, capture_age_ms=capture_age_ms,
         )
         logger.info("EVENTO #%d %s track=%s zone=%s risk=%s", eid, event_type, st.track_id, zone, risk)
         if self.on_event and (imgs.context or imgs.person_crop or event_type in ALERT_TAGS):
@@ -189,9 +211,11 @@ class EventEngine:
     # ------------------------------------------------------------- principais
     def step(self, frame: np.ndarray, detections: list[Detection],
              now: Optional[float] = None,
-             observed_at: Optional[datetime] = None) -> list[int]:
+             observed_at: Optional[datetime] = None,
+             captured_at: Optional[datetime] = None) -> list[int]:
         now = time.monotonic() if now is None else now
         self._observed_at = observed_at or datetime.now().astimezone()
+        self._captured_at = captured_at
         ids: list[int] = []
         states = self.book.update(detections, frame, now)
         for st in states:
@@ -201,6 +225,7 @@ class EventEngine:
                 st.finalized = True
                 ids.extend(self._finalize(frame, st, now))
         self.book.prune(now)
+        ids.extend(self._flush_passages(now))
         return ids
 
     def _process(self, frame: np.ndarray, st: TrackState, now: float) -> list[int]:
@@ -394,18 +419,105 @@ class EventEngine:
             if st.gate_dwell_emitted and not st.entry_done:
                 return ids  # aproximação do portão já registrada
             if st.zones_seen & {"ZONA_RUA", "ZONA_PORTAO"}:
-                ids.append(self._emit("passagem_pessoa", st, st.current_zone or "ZONA_RUA", frame,
-                                      meta=self._direction_meta(st)))
+                if self._passage_eligible(st):
+                    self._queue_passage("passagem_pessoa", st, st.current_zone or "ZONA_RUA",
+                                        frame, now)
         elif st.cls_name in VEHICLE_CLASSES:
             if st.stopped_since is not None and (now - st.stopped_since) >= self.rules.vehicle_stop_seconds:
                 # veículo que ficou parado e foi embora: se houve interação, já foi emitida
                 return ids
-            if "ZONA_RUA" in st.zones_seen:
-                ids.append(self._emit("passagem_veiculo", st, "ZONA_RUA", frame,
-                                      meta={"classe": st.cls_name, **self._direction_meta(st)}))
+            if "ZONA_RUA" in st.zones_seen and self._passage_eligible(st):
+                self._queue_passage("passagem_veiculo", st, "ZONA_RUA", frame, now)
         elif st.cls_name in ANIMAL_CLASSES:
-            ids.append(self._emit("animal", st, st.current_zone or "ZONA_RUA", frame,
-                                  meta={"classe": st.cls_name, **self._direction_meta(st)}))
+            if self._passage_eligible(st):
+                self._queue_passage("animal", st, st.current_zone or "ZONA_RUA", frame, now)
+        return ids
+
+    # ------------------------------------------------- confirmação/agregação
+    def _confirmed(self, st: TrackState) -> bool:
+        """Evidência mínima: N detecções OU tempo de vida suficiente."""
+        lifetime = st.last_seen - st.first_seen
+        return (st.hits >= self.limits.track_min_hits
+                or lifetime >= self.limits.track_min_lifetime_s)
+
+    def _passage_eligible(self, st: TrackState) -> bool:
+        """Confirmação + deslocamento real (objeto estático não vira passagem)."""
+        if not self._confirmed(st):
+            return False
+        return (st.total_path_px >= self.limits.passage_min_path_px
+                or len(st.zones_seen) >= 2)
+
+    @staticmethod
+    def _directions_compatible(a: str, b: str) -> bool:
+        return a == b or "indeterminada" in (a, b)
+
+    @staticmethod
+    def _centroid(st: TrackState) -> tuple[float, float]:
+        if not st.history:
+            return (0.0, 0.0)
+        _, cx, cy = st.history[-1]
+        return (cx, cy)
+
+    def _queue_passage(self, event_type: str, st: TrackState, zone: str,
+                       frame: np.ndarray, now: float) -> None:
+        meta = self._direction_meta(st)
+        direction = meta.get("direcao", "indeterminada")
+        cx, cy = self._centroid(st)
+        for ep in self._pending_passages:
+            if ep["event_type"] != event_type or ep["cls_name"] != st.cls_name:
+                continue
+            if not self._directions_compatible(ep["direction"], direction):
+                continue
+            if ep["zone"] is not None and zone is not None and ep["zone"] != zone:
+                continue
+            ex, ey = ep["centroid"]
+            if ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5 > self.limits.passage_merge_distance_px:
+                continue
+            if now - ep["last_seen"] > self.limits.passage_merge_s:
+                continue
+            # funde: preserva a primeira observação e a maior evidência
+            ep["last_seen"] = now
+            ep["centroid"] = (cx, cy)
+            ep["merged_tracks"].append(st.track_id)
+            if st.total_path_px > ep["path_px"]:
+                ep["track"] = st
+                ep["frame"] = frame
+                ep["zone"] = zone
+                ep["direction"] = direction
+                ep["meta"] = meta
+                ep["path_px"] = st.total_path_px
+            return
+        self._pending_passages.append({
+            "event_type": event_type,
+            "cls_name": st.cls_name,
+            "zone": zone,
+            "direction": direction,
+            "centroid": (cx, cy),
+            "first_seen": now,
+            "last_seen": now,
+            "track": st,
+            "frame": frame,
+            "meta": meta,
+            "path_px": st.total_path_px,
+            "observed_at": self._observed_at or datetime.now().astimezone(),
+            "captured_at": self._captured_at,
+            "merged_tracks": [st.track_id],
+        })
+
+    def _flush_passages(self, now: float) -> list[int]:
+        """Emite os episódios maduros — um evento por passagem, não por fragmento."""
+        ids: list[int] = []
+        for ep in list(self._pending_passages):
+            if now - ep["last_seen"] < self.limits.passage_merge_s:
+                continue
+            self._pending_passages.remove(ep)
+            meta = {**ep["meta"], "merged_tracks": sorted(set(ep["merged_tracks"]))}
+            ids.append(self._emit(
+                ep["event_type"], ep["track"], ep["zone"], ep["frame"],
+                meta=meta,
+                observed_override=ep["observed_at"],
+                captured_override=ep["captured_at"],
+            ))
         return ids
 
     def _direction_meta(self, st: TrackState) -> dict:

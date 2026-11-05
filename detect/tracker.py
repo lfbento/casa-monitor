@@ -24,6 +24,7 @@ class TrackState:
     speed_px_s: float = 0.0
     total_path_px: float = 0.0
     last_conf: float = 0.0             # confiança da última detecção do track
+    hits: int = 0                      # quantas detecções este track já recebeu
     zones_seen: set = field(default_factory=set)
     current_zone: str | None = None
     last_entry: str | None = None       # 'ENTRY' | 'EXIT' pendente de emitir
@@ -60,6 +61,7 @@ class TrackState:
         self.history.append((now, cx, cy))
         self.bboxes.append((det.x1, det.y1, det.x2, det.y2))
         self.last_conf = det.conf
+        self.hits += 1
         self.last_seen = now
 
     def set_appearance(self, frame_bgr: np.ndarray) -> None:

@@ -96,6 +96,8 @@ class Store:
                 "person_crop_path": "TEXT",
                 "observed_at": "TEXT",
                 "detect_latency_ms": "INTEGER",
+                "captured_at": "TEXT",
+                "capture_age_ms": "INTEGER",
             },
             "house_sessions": {
                 "entry_track_id": "INTEGER",
@@ -124,16 +126,18 @@ class Store:
                   snapshot_path: Optional[str] = None, meta: Optional[str] = None,
                   person_crop_path: Optional[str] = None,
                   observed_at: Optional[str] = None,
-                  detect_latency_ms: Optional[int] = None) -> int:
+                  detect_latency_ms: Optional[int] = None,
+                  captured_at: Optional[str] = None,
+                  capture_age_ms: Optional[int] = None) -> int:
         assert event_type in EVENT_TYPES, f"event_type inválido: {event_type}"
         cur = self._conn.execute(
             "INSERT INTO events (timestamp_start, timestamp_end, event_type, track_id, zone,"
             " vlm_description, risk_level, snapshot_path, meta, person_crop_path,"
-            " observed_at, detect_latency_ms)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " observed_at, detect_latency_ms, captured_at, capture_age_ms)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts_start or _now_iso(), ts_end, event_type, track_id, zone,
              vlm_description, risk_level, snapshot_path, meta, person_crop_path,
-             observed_at, detect_latency_ms),
+             observed_at, detect_latency_ms, captured_at, capture_age_ms),
         )
         self._conn.commit()
         return int(cur.lastrowid)
@@ -149,7 +153,8 @@ class Store:
     def events_between(self, ts_from: str, ts_to: str) -> list[dict]:
         cur = self._conn.execute(
             "SELECT id, timestamp_start, timestamp_end, event_type, track_id, zone,"
-            " vlm_description, risk_level, snapshot_path, meta FROM events"
+            " vlm_description, risk_level, snapshot_path, meta,"
+            " captured_at, capture_age_ms FROM events"
             " WHERE timestamp_start >= ? AND timestamp_start < ? ORDER BY timestamp_start",
             (ts_from, ts_to),
         )
@@ -255,7 +260,8 @@ class Store:
         cur = self._conn.execute(
             "SELECT id, timestamp_start, event_type, track_id, zone, vlm_description,"
             " risk_level, snapshot_path, meta, person_label, person_crop_path,"
-            " observed_at, detect_latency_ms FROM events WHERE id=?", (event_id,))
+            " observed_at, detect_latency_ms, captured_at, capture_age_ms"
+            " FROM events WHERE id=?", (event_id,))
         row = cur.fetchone()
         if not row:
             return None

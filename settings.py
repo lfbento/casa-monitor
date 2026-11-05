@@ -93,6 +93,29 @@ class PipelineLimits:
     analysis_min_area_px: int = field(default_factory=lambda: _positive_int("ANALYSIS_MIN_AREA_PX", 2500))
     analysis_min_conf: float = field(default_factory=lambda: _positive_float("ANALYSIS_MIN_CONF", 0.5))
     analysis_timeout_s: float = field(default_factory=lambda: _positive_float("ANALYSIS_TIMEOUT_SECONDS", 30.0))
+    # ---- frescor da captura (OSD vs chegada) ----
+    capture_age_warn_s: float = field(default_factory=lambda: _positive_float("CAPTURE_AGE_WARN_SECONDS", 30.0))
+    capture_age_fail_s: float = field(default_factory=lambda: _positive_float("CAPTURE_AGE_FAIL_SECONDS", 60.0))
+    capture_age_ocr_interval_s: float = field(
+        default_factory=lambda: _positive_float("CAPTURE_AGE_OCR_INTERVAL_SECONDS", 30.0))
+    capture_age_resync_s: float = field(
+        default_factory=lambda: _positive_float("CAPTURE_AGE_RESYNC_SECONDS", 300.0))
+    capture_age_resync_wait_s: float = field(
+        default_factory=lambda: _positive_float("CAPTURE_AGE_RESYNC_WAIT_SECONDS", 10.0))
+    # ---- cadência e gate de movimento ----
+    detect_min_effective_ratio: float = field(
+        default_factory=lambda: _positive_float("DETECT_MIN_EFFECTIVE_RATIO", 0.5))
+    motion_sanity_interval_s: float = field(
+        default_factory=lambda: _positive_float("MOTION_SANITY_INTERVAL_SECONDS", 10.0))
+    # ---- confirmação e agregação de passagem ----
+    track_min_hits: int = field(default_factory=lambda: _positive_int("TRACK_MIN_HITS", 3))
+    track_min_lifetime_s: float = field(
+        default_factory=lambda: _positive_float("TRACK_MIN_LIFETIME_S", 1.5))
+    passage_merge_s: float = field(default_factory=lambda: _positive_float("PASSAGE_MERGE_SECONDS", 5.0))
+    passage_merge_distance_px: int = field(
+        default_factory=lambda: _positive_int("PASSAGE_MERGE_DISTANCE_PX", 200))
+    passage_min_path_px: int = field(
+        default_factory=lambda: _positive_int("PASSAGE_MIN_PATH_PX", 40))
 
 
 def ensure_dirs() -> None:

@@ -62,7 +62,7 @@ def test_legacy_database_is_migrated_without_losing_records(tmp_path: Path) -> N
         person = migrated.known_people()[0]
 
         assert "person_crop_path" in event_columns
-        assert {"observed_at", "detect_latency_ms"} <= event_columns
+        assert {"observed_at", "detect_latency_ms", "captured_at", "capture_age_ms"} <= event_columns
         assert {"entry_track_id", "appearance_hist", "last_seen_time", "match_status"} <= session_columns
         assert person["name"] == "Bento"
         assert person["signature_source"] == "full_frame"
@@ -73,5 +73,16 @@ def test_legacy_database_is_migrated_without_losing_records(tmp_path: Path) -> N
         assert legacy is not None
         assert legacy["observed_at"] is None
         assert legacy["detect_latency_ms"] is None
+        assert legacy["captured_at"] is None
+        assert legacy["capture_age_ms"] is None
+
+        eid = migrated.add_event(
+            event_type="passagem_pessoa", track_id=9, zone="ZONA_RUA",
+            captured_at="2026-11-05T08:37:25-03:00", capture_age_ms=3690000,
+        )
+        fresh = migrated.event_by_id(eid)
+        assert fresh is not None
+        assert fresh["captured_at"] == "2026-11-05T08:37:25-03:00"
+        assert fresh["capture_age_ms"] == 3690000
     finally:
         migrated.close()

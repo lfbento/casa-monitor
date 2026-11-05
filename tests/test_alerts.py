@@ -126,8 +126,8 @@ def test_alert_caption_uses_observation_time_and_flags_delay(store, monkeypatch)
     _run(p._send_alert_now(eid, "alerta_suspeito", imgs))
 
     caption = sent[0]
-    assert f"Observado: {observed}" in caption
-    assert "Atraso:" in caption
+    assert f"Recebido: {observed}" in caption
+    assert "Processamento:" in caption and "acima do limite" in caption
     assert p._last_alert_latency_ms >= 9_000
 
 
@@ -156,3 +156,61 @@ def test_alert_is_not_blocked_by_analysis_executor(store, monkeypatch):
 
     assert sent
     assert elapsed < 1.0
+
+
+def test_caption_reports_capture_age_and_stale_marker(store):
+    from datetime import datetime, timedelta
+
+    p = _pipe(store)
+    now = datetime.now().astimezone()
+    eid = store.add_event(
+        event_type="acesso_casa", track_id=1, zone="LINHA_ACESSO_CASA",
+        observed_at=now.isoformat(timespec="seconds"),
+        captured_at=(now - timedelta(hours=5)).isoformat(timespec="seconds"),
+        capture_age_ms=5 * 3600 * 1000,
+        meta='{"direcao": "ENTRY"}',
+    )
+    ev = store.event_by_id(eid)
+
+    caption = p._alert_caption(eid, "acesso_casa", ev, "pessoa desconhecida")
+
+    assert "⚠️ Conteúdo atrasado" in caption
+    assert "Capturado: " in caption and "(5h00m atrás)" in caption
+    assert "Recebido: " in caption
+    assert "Processamento: " in caption
+
+
+def test_caption_without_capture_age_says_unknown(store):
+    from datetime import datetime
+
+    p = _pipe(store)
+    now = datetime.now().astimezone()
+    eid = store.add_event(
+        event_type="alerta_suspeito", track_id=2, zone="ZONA_PORTAO",
+        observed_at=now.isoformat(timespec="seconds"),
+    )
+    ev = store.event_by_id(eid)
+
+    caption = p._alert_caption(eid, "alerta_suspeito", ev, "pessoa desconhecida")
+
+    assert "Capturado: desconhecido" in caption
+    assert "⚠️ Conteúdo atrasado" not in caption
+
+
+def test_caption_within_limit_has_no_stale_marker(store):
+    from datetime import datetime, timedelta
+
+    p = _pipe(store)
+    now = datetime.now().astimezone()
+    eid = store.add_event(
+        event_type="aproximacao_portao", track_id=3, zone="ZONA_PORTAO",
+        observed_at=now.isoformat(timespec="seconds"),
+        captured_at=(now - timedelta(seconds=10)).isoformat(timespec="seconds"),
+        capture_age_ms=10_000,
+    )
+    ev = store.event_by_id(eid)
+
+    caption = p._alert_caption(eid, "aproximacao_portao", ev, "pessoa desconhecida")
+
+    assert "⚠️ Conteúdo atrasado" not in caption
+    assert "(10s atrás)" in caption

@@ -42,7 +42,7 @@ Fatos observados em produção que restringem o desenho:
 
 ### D1 — Idade de captura lida do watermark do frame (OSD)
 
-O único instante de captura em banda é o OSD. O leitor recorta a faixa fixa do OSD (topo-esquerdo do frame 2560×1440), segmenta as células de caractere por passo fixo e classifica cada célula por correlação com templates de `0–9`, `/` e `:` derivados do próprio frame, sem dependência nova de OCR. Com o texto `YYYY/MM/DD HH:MM:SS`, calcula `capture_age = arrival_wall − osd_time`.
+O único instante de captura em banda é o OSD. O leitor recorta a faixa fixa do OSD em geometria de referência 2560×1440, **escalada proporcionalmente** para a resolução recebida (o transcode para 1920×1080 preserva a posição relativa), segmenta as células de caractere por passo fixo e classifica cada célula por correlação com templates de `0–9`, `/` e `:` derivados do próprio frame, sem dependência nova de OCR. Com o texto `YYYY/MM/DD HH:MM:SS`, calcula `capture_age = arrival_wall − osd_time`.
 
 - Cadência de leitura: `CAPTURE_AGE_OCR_INTERVAL_SECONDS` (padrão 30 s); o valor é reutilizado entre leituras e suavizado por mediana de 3 amostras.
 - `captured_at` = instante do OSD convertido para o fuso local; `capture_age_ms` = idade no momento da emissão.
@@ -63,9 +63,11 @@ Sinais: `capture_age` (D1) como medida absoluta, `Δpts/Δwall` como sinal rápi
 Recuperação em duas camadas:
 
 1. **Resync pelo nosso lado**: ao exceder `CAPTURE_AGE_RESYNC_SECONDS`, fechar o WS e aguardar `CAPTURE_AGE_RESYNC_WAIT_SECONDS` (padrão 10 s) para o Miloco destruir o transcoder, reconectar e medir a idade. O teardown só acontece quando não há nenhum cliente no stream; se outra aba do Miloco mantiver o fluxo, registrar `resync bloqueado por outro cliente` e manter a violação observável.
-2. **Correção na fonte (patch local do Miloco, fora deste repositório)**: limitar o buffer do transcoder — ao passar de um teto (ex.: 2 MB), descartar frames até o próximo keyframe e re-sincronizar (`_synced=False`) em vez de acumular; e reduzir `H264_WIDTH` para uma largura que o encoder acompanhe (1920 ou 1280). Aplicação exige aprovação, reinício do transcode e revalidação da idade.
+2. **Correção na fonte (patch local do Miloco, fora deste repositório)**: limitar o buffer do transcoder — ao passar de um teto (`H264_MAX_BUFFER_MB`, padrão 2 MB), descartar frames até o próximo keyframe e re-sincronizar (`_synced=False`) em vez de acumular; reduzir `H264_WIDTH` para 1920; e encerrar o stream quando a última conexão cair (o fan-out removia a conexão morta sem parar o transcode, deixando o buffer órfão). Aplicação exige reinício do transcode e revalidação da idade.
 
 O intervalo descartado nunca gera evento. Se nem o resync nem o patch reduzirem a idade, a falha persistente é registrada com o valor medido, sem retry silencioso.
+
+**Achado do apply (importante):** com o teto de 2 MB ativo, o buffer do `stdin` do ffmpeg ficou em 0 MB e a entrada em ~20 fps — parte do atraso estava em outra fila, no agendamento de callbacks do SDK MIoT (`run_coroutine_threadsafe` por frame). Uma tentativa de coalescer essa fila no `miot_camera.py` foi revertida: o descarte quebrava a cadeia de referência HEVC e o stream passou a sair cinza (taxa de entrada despencou). Ficou documentado que o backlog residual da instância da câmera sobrevive ao restart do raw stream e a recuperação confiável é reiniciar o container do Miloco; o resync automático detecta e registra `bloqueado` em vez de fingir recuperação.
 
 ### D3 — Throughput: perfilar antes de decidir
 
@@ -105,7 +107,7 @@ Corrigir a condição para `continue` incondicional quando não há movimento. M
 ## Risks / Trade-offs
 
 - OCR custa CPU e pode errar → rodar a cada 30 s, recorte pequeno, mediana de 3, contador de falhas; nunca fabricar idade.
-- Região do OSD muda com resolução/config da câmera → validar dimensões conhecidas (2560×1440) e falhar explicitamente em tamanho inesperado.
+- Região do OSD muda com resolução/config da câmera → validar proporção 16:9 e escala, falhando explicitamente fora disso; os templates são reescalados por célula.
 - Agregação pode fundir duas pessoas distintas → exigir direção compatível + distância máxima + janela curta; métricas de fusões e teste com duas pessoas próximas.
 - Confirmação atrasa eventos → limitar a 1,5 s; alertas de portão/acesso não passam por ela.
 - Reancorar via resync pode pular um evento → registrar o intervalo descartado e o valor de frescor antes/depois; é preferível a entregar horas de passado como presente.

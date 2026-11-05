@@ -84,3 +84,16 @@ def test_generate_report_uses_fallback_when_llm_invalid(monkeypatch, tmp_path):
     assert "Resumo do período (consolidação)" in text
     assert all(s in text for s in dr._REQUIRED_SECTIONS)
     store.close()
+
+
+def test_totals_include_capture_freshness():
+    log = _log()
+    log["frescor"] = {"amostras": 10, "desconhecidos": 2,
+                      "min_ms": 2_000, "max_ms": 5 * 3600 * 1000}
+
+    text = dr._render_totals(log)
+
+    assert "Frescor da captura" in text
+    assert "mínimo=2s" in text
+    assert "máximo=5h00m" in text
+    assert "sem horário de captura=2" in text

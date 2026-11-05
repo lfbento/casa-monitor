@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import NamedTuple, Optional
 
 from capture.decoder import Frame, H264StreamDecoder
+from capture.osd import OsdClock
 from capture.ws_client import MilocoClient
 from db.store import Store
 from detect.yolo_engine import ANIMAL_CLASSES, VEHICLE_CLASSES, YoloEngine
@@ -39,6 +40,8 @@ class FrameEnvelope(NamedTuple):
     gray: object
     motion: bool
     changed: int
+    captured_at: Optional[datetime] = None
+    capture_age_s: Optional[float] = None
 
 
 class MonitorPipeline:
@@ -48,11 +51,12 @@ class MonitorPipeline:
         self.rules = rules or RulesConfig()
         self.zones = Zones.load()
         self.store = Store()
+        self.limits = PipelineLimits()
         self.engine = EventEngine(self.zones, self.rules, self.store,
                                   snapshot_dir=DATA_DIR / "snapshots",
-                                  on_event=self._on_event)
+                                  on_event=self._on_event,
+                                  limits=self.limits)
         self.yolo: YoloEngine | None = None
-        self.limits = PipelineLimits()
         self._vlm_queue: asyncio.Queue = asyncio.Queue(maxsize=self.limits.analysis_queue_max)
         self._vlm_prio: asyncio.Queue = asyncio.Queue(
             maxsize=max(2, min(4, self.limits.analysis_queue_max)))  # alertas na frente
@@ -89,6 +93,31 @@ class MonitorPipeline:
         self._analysis_dropped = 0
         self._analysis_deduped = 0
         self._last_alert_latency_ms: Optional[int] = None
+        # ---- frescor de captura (OSD vs chegada) ----
+        self.osd = OsdClock(self.limits.capture_age_ocr_interval_s)
+        self._last_capture_age_s: Optional[float] = None
+        self._max_capture_age_s: Optional[float] = None
+        self._last_captured_at: Optional[datetime] = None
+        self._capture_unknown = 0
+        # ---- resync do stream quando a fonte entrega conteúdo atrasado ----
+        self._resync_requested = False
+        self._resync_before: Optional[float] = None
+        self._last_resync_attempt = 0.0
+        # ---- instrumentação do ciclo (perfil de throughput) ----
+        self._cycle_wait_ms: deque = deque(maxlen=600)
+        self._cycle_infer_ms: deque = deque(maxlen=600)
+        self._cycle_step_ms: deque = deque(maxlen=600)
+        self._reader_busy_s = 0.0
+        self._reader_frames = 0
+        self._cadence_ts: Optional[float] = None
+        self._cadence_n = 0
+        self._cadence_fps: Optional[float] = None
+        # ---- gate de movimento ----
+        self._last_inference_ts = 0.0
+        self._frames_no_motion = 0
+        self._sanity_detections = 0
+        self._motion_frames = 0
+        self._win_motion_n = 0
 
     # ------------------------------------------------------------- VLM worker
     def _on_event(self, event_id: int, event_type: str, imgs) -> None:
@@ -199,6 +228,22 @@ class MonitorPipeline:
         now = datetime.now(obs.tzinfo) if obs.tzinfo else datetime.now()
         return max(0, int((now - obs).total_seconds() * 1000))
 
+    @staticmethod
+    def _format_age(age_ms: Optional[int]) -> str:
+        if age_ms is None:
+            return "?"
+        total = max(0, int(age_ms / 1000))
+        if total < 60:
+            return f"{total}s"
+        minutes, seconds = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m{seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h{minutes:02d}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d{hours:02d}h"
+
     def _alert_caption(self, event_id: int, event_type: str, ev: dict,
                        quem: str, analise: Optional[str] = None) -> str:
         if event_type == "aproximacao_portao":
@@ -209,14 +254,27 @@ class MonitorPipeline:
         else:
             titulo = "⚠️ Comportamento atípico"
         observed = ev.get("observed_at") or ev.get("timestamp_start") or "?"
+        captured = ev.get("captured_at")
+        capture_age_ms = ev.get("capture_age_ms")
+        aviso = ""
+        if captured:
+            captured_line = (f"Capturado: {captured} "
+                             f"({self._format_age(capture_age_ms)} atrás)")
+            if (capture_age_ms is not None
+                    and capture_age_ms > self.limits.capture_age_fail_s * 1000):
+                aviso = "⚠️ Conteúdo atrasado (acima do limite de frescor)\n"
+        else:
+            captured_line = "Capturado: desconhecido (idade de captura indisponível)"
         latency_ms = self._alert_latency_ms(observed)
-        atraso = ""
+        processamento = ("—" if latency_ms is None else f"{latency_ms}ms")
         if latency_ms is not None and latency_ms > self.limits.alert_max_latency_s * 1000:
-            atraso = f"⚠️ Atraso: {latency_ms / 1000:.1f}s (acima do limite)\n"
+            processamento += f" ⚠️ acima do limite de {self.limits.alert_max_latency_s:.0f}s"
         caption = (
             f"{titulo} — evento #{event_id}\n"
-            f"Observado: {observed} | Zona: {ev.get('zone', '?')}\n"
-            f"{atraso}"
+            f"{aviso}"
+            f"{captured_line}\n"
+            f"Recebido: {observed} | Zona: {ev.get('zone', '?')}\n"
+            f"Processamento: {processamento}\n"
             f"Quem: {quem}\n"
         )
         if analise is not None:
@@ -282,10 +340,40 @@ class MonitorPipeline:
                 logger.exception("vlm_worker travou (%s) — reiniciando laço", err)
                 await asyncio.sleep(1)
 
+    @staticmethod
+    def _p95(samples: deque) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(samples)
+        return ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+
+    def _cycle_line(self) -> str:
+        cadence = self._cadence_fps
+        cfg = max(1, self.detect_cfg.fps)
+        cad = "—" if cadence is None else f"{cadence:.1f}fps"
+        warn = ""
+        motion_window = self._motion_frames - self._win_motion_n
+        if (cadence is not None and motion_window > 0
+                and cadence < cfg * self.limits.detect_min_effective_ratio):
+            warn = f" ⚠️ abaixo de {cfg * self.limits.detect_min_effective_ratio:.1f}fps"
+        reader_ms = (1000 * self._reader_busy_s / self._reader_frames
+                     if self._reader_frames else 0.0)
+        return (
+            f"cadência={cad} (cfg {cfg}){warn}"
+            f" | ciclo ms p50/p95: espera={self._p95(self._cycle_wait_ms):.0f}"
+            f" infer={self._p95(self._cycle_infer_ms):.0f}"
+            f" step={self._p95(self._cycle_step_ms):.0f}"
+            f" | leitura={reader_ms:.1f}ms/frame"
+        )
+
     def _watchdog_line(self) -> str:
         worker_alive = self._vlm_task is not None and not self._vlm_task.done()
         latency = ("—" if self._last_alert_latency_ms is None
                    else f"{self._last_alert_latency_ms}ms")
+        frescor = ("desconhecida" if self._last_capture_age_s is None
+                   else f"{self._last_capture_age_s:.0f}s")
+        frescor_max = ("—" if self._max_capture_age_s is None
+                       else f"{self._max_capture_age_s:.0f}s")
         return (
             f"FILA: análise={self._vlm_queue.qsize()} | prioritária={self._vlm_prio.qsize()}"
             f" | worker vivo={worker_alive}"
@@ -293,6 +381,9 @@ class MonitorPipeline:
             f" descartados_idade={self._frames_dropped}"
             f" substituídos={self._frames_overwritten}"
             f" idade_max={self._max_frame_age_ms}ms"
+            f" | frescor={frescor} (máx {frescor_max}) ocr_falhas={self.osd.failures}"
+            f" | sem_movimento={self._frames_no_motion} sanidade={self._sanity_detections}"
+            f" | {self._cycle_line()}"
             f" | análise descartada={self._analysis_dropped}"
             f" deduplicada={self._analysis_deduped}"
             f" | latência_alerta={latency}"
@@ -302,6 +393,19 @@ class MonitorPipeline:
         """Loga filas, frescor e latência a cada 60s + vigia se o worker está vivo."""
         while True:
             await asyncio.sleep(60)
+            mono = time.monotonic()
+            if self._cadence_ts is not None:
+                elapsed = max(1e-6, mono - self._cadence_ts)
+                self._cadence_fps = (self._n_processed - self._cadence_n) / elapsed
+            self._cadence_ts, self._cadence_n = mono, self._n_processed
+            self._win_motion_n = self._motion_frames
+            if (self._last_capture_age_s is not None
+                    and self._last_capture_age_s > self.limits.capture_age_fail_s):
+                logger.error(
+                    "frescura violada: idade de captura %.0fs (limite %.0fs) — capturado %s",
+                    self._last_capture_age_s, self.limits.capture_age_fail_s,
+                    self._last_captured_at.isoformat(timespec="seconds")
+                    if self._last_captured_at else "desconhecido")
             logger.info(self._watchdog_line())
 
     async def _describe_event(self, event_id: int, event_type: str,
@@ -434,6 +538,48 @@ class MonitorPipeline:
         self._prev_small = gray
         return motion, changed
 
+    def _detect_decision(self, env: FrameEnvelope, now: float) -> tuple[bool, bool]:
+        """Decide se este frame vai ao detector; retorna (rodar, foi sanidade)."""
+        if env.motion:
+            self._motion_frames += 1
+            return True, False
+        if now - self._last_inference_ts >= self.limits.motion_sanity_interval_s:
+            self._sanity_detections += 1
+            return True, True
+        self._frames_no_motion += 1
+        return False, False
+
+    def _maybe_request_resync(self, capture_age: Optional[float]) -> bool:
+        """Pede reconexão quando o conteúdo está velho além do limite (com cooldown)."""
+        if capture_age is None or capture_age <= self.limits.capture_age_resync_s:
+            return False
+        now = time.monotonic()
+        if now - self._last_resync_attempt < self.limits.capture_age_resync_s:
+            return False
+        self._last_resync_attempt = now
+        self._resync_before = capture_age
+        self._resync_requested = True
+        logger.warning(
+            "resync solicitado: idade de captura %.0fs > %.0fs — reconectando o stream",
+            capture_age, self.limits.capture_age_resync_s)
+        return True
+
+    def _prepare_resync(self) -> None:
+        """Descarta tudo que veio do intervalo antigo: nada dele pode gerar evento."""
+        self._latest = None
+        self.engine.reset()
+        self._last_capture_age_s = None
+        self._max_capture_age_s = None
+        self._last_captured_at = None
+        self.osd.reset()
+
+    def _resync_verdict(self, before: Optional[float], after: Optional[float]) -> str:
+        if after is None:
+            return "bloqueado (sem leitura de OSD após reconectar)"
+        if after <= self.limits.capture_age_warn_s:
+            return "recuperado"
+        return "bloqueado (outro cliente mantém o stream?)"
+
     def _take_frame(self, now: float) -> Optional[FrameEnvelope]:
         """Pega o frame mais recente; descarta e conta se estiver velho demais."""
         env = self._latest
@@ -442,6 +588,16 @@ class MonitorPipeline:
         age = now - env.frame.arrival_mono
         self._max_frame_age_ms = max(self._max_frame_age_ms, int(age * 1000))
         self._latest = None
+        if env.captured_at is not None:
+            # idade medida na chegada + tempo que o frame passou no slot
+            base = env.capture_age_s or 0.0
+            capture_age = max(0.0, base + (time.time() - env.frame.arrival_wall))
+            env = env._replace(capture_age_s=capture_age)
+            self._last_capture_age_s = capture_age
+            self._last_captured_at = env.captured_at
+            self._max_capture_age_s = max(self._max_capture_age_s or 0.0, capture_age)
+        else:
+            self._capture_unknown += 1
         if age > self.limits.max_frame_age_s:
             self._frames_dropped += 1
             return None
@@ -455,18 +611,44 @@ class MonitorPipeline:
         sw, sh = 320, 180
         self._motion_mask = self._build_motion_mask()
         async for chunk in client.stream_h264(camera_id):
+            t_read = time.monotonic()
+            chunk_frames = 0
             for frame in decoder.feed(chunk):
+                chunk_frames += 1
                 self._frames_seen += 1
                 gray = cv2.cvtColor(cv2.resize(frame.image, (sw, sh)), cv2.COLOR_BGR2GRAY)
                 self._cur_gray = gray
                 motion, changed = self._motion(gray)
+                captured_at, capture_age = self.osd.observe(
+                    frame.image, frame.arrival_wall, frame.arrival_mono)
+                if self._resync_before is not None and captured_at is not None:
+                    verdict = self._resync_verdict(self._resync_before, capture_age)
+                    if verdict == "recuperado":
+                        logger.warning("resync recuperado: idade %.0fs -> %.0fs",
+                                       self._resync_before, capture_age or 0)
+                    else:
+                        logger.error("resync %s: idade antes=%.0fs depois=%s",
+                                     verdict, self._resync_before,
+                                     "?" if capture_age is None else f"{capture_age:.0f}s")
+                    self._resync_before = None
+                if self._maybe_request_resync(capture_age):
+                    self._latest = None
+                    return
+                frame.captured_at = captured_at
+                frame.capture_age_s = capture_age
                 if self._latest is not None:
                     self._frames_overwritten += 1  # substituído antes de ser processado
-                self._latest = FrameEnvelope(frame, gray, motion, changed)
+                self._latest = FrameEnvelope(frame, gray, motion, changed,
+                                             captured_at, capture_age)
+                await asyncio.sleep(0)
+            if chunk_frames:
+                self._reader_busy_s += time.monotonic() - t_read
+                self._reader_frames += chunk_frames
 
     async def _process_frames(self, duration_seconds: Optional[float], t0: float) -> None:
         """Amostra a DETECT_FPS, sempre do frame mais recente, sem travar a leitura."""
         interval = 1.0 / max(1, self.detect_cfg.fps)
+        last_end = time.monotonic()
         while True:
             await asyncio.sleep(0.005)
             now = time.monotonic()
@@ -475,31 +657,65 @@ class MonitorPipeline:
             env = self._take_frame(now)
             if env is None:
                 continue
-            if not env.motion:
+            self._cycle_wait_ms.append((now - last_end) * 1000)
+            run_detect, sanity = self._detect_decision(env, now)
+            if not run_detect:
                 wait = interval - (now - self._last_detect_ts)
                 if wait > 0:
                     await asyncio.sleep(wait)
-                    continue
+                continue
             self._last_detect_ts = time.monotonic()
+            self._last_inference_ts = self._last_detect_ts
             if float(env.frame.image.std()) < 8.0:
                 continue  # frame cinza (warm-up) não entra no detector
             if env.motion:
                 logger.info("debug-motion: %d px alterados (movimento real)", env.changed)
+            t_infer = time.monotonic()
             dets = await asyncio.to_thread(self.yolo.track, env.frame.image)
+            self._cycle_infer_ms.append((time.monotonic() - t_infer) * 1000)
             for d in dets:
                 if d.cls_name == "person":
                     logger.info("debug-person: track=%s center=(%.0f,%.0f) zone=%s",
                                 d.track_id, d.center[0], d.center[1],
                                 self.engine.zones.zone_at(*d.center))
             observed_at = datetime.fromtimestamp(env.frame.arrival_wall).astimezone()
+            t_step = time.monotonic()
             ids = self.engine.step(env.frame.image, dets, time.monotonic(),
-                                   observed_at=observed_at)
+                                   observed_at=observed_at,
+                                   captured_at=env.captured_at)
+            self._cycle_step_ms.append((time.monotonic() - t_step) * 1000)
+            last_end = time.monotonic()
             self._n_processed += 1
             self._n_events += len(ids)
             if self._n_processed % 300 == 0:
                 logger.info("stats: frames=%d processados=%d eventos=%d tracks=%d idade_max=%dms",
                             self._frames_seen, self._n_processed, self._n_events,
                             len(self.engine.book.tracks), self._max_frame_age_ms)
+
+    async def _run_stream(self, client: MilocoClient, camera_id: str,
+                          decoder: H264StreamDecoder,
+                          duration_seconds: float | None, t0: float) -> bool:
+        """Uma conexão: retorna True se terminou normalmente, False se pediu resync."""
+        self._resync_requested = False
+        reader = asyncio.create_task(self._read_frames(client, camera_id, decoder))
+        processor = asyncio.create_task(self._process_frames(duration_seconds, t0))
+        try:
+            done, _pending = await asyncio.wait(
+                {reader, processor}, return_when=asyncio.FIRST_COMPLETED)
+            if self._resync_requested and reader in done:
+                return False
+            for task in done:
+                task.result()  # propaga erro de leitura/processamento
+            if duration_seconds and processor in done:
+                logger.info("teste encerrado: frames=%d processados=%d eventos=%d",
+                            self._frames_seen, self._n_processed, self._n_events)
+            return True
+        finally:
+            for task in (reader, processor):
+                task.cancel()
+            for task in (reader, processor):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     async def run(self, duration_seconds: float | None = None) -> None:
         if self.yolo is None:
@@ -512,29 +728,31 @@ class MonitorPipeline:
         self._vlm_task = vlm_task
         watchdog = asyncio.create_task(self._queue_watchdog())
         logger.info(
-            "pipeline rodando (detecção a %d FPS) | frame_age=%.1fs | fila_análise=%d",
-            self.detect_cfg.fps, self.limits.max_frame_age_s, self.limits.analysis_queue_max)
+            "pipeline rodando (detecção a %d FPS) | frame_age=%.1fs | fila_análise=%d"
+            " | frescor: aviso=%.0fs falha=%.0fs resync=%.0fs",
+            self.detect_cfg.fps, self.limits.max_frame_age_s, self.limits.analysis_queue_max,
+            self.limits.capture_age_warn_s, self.limits.capture_age_fail_s,
+            self.limits.capture_age_resync_s)
         t0 = time.monotonic()
-        reader = asyncio.create_task(self._read_frames(client, camera_id, decoder))
-        processor = asyncio.create_task(self._process_frames(duration_seconds, t0))
         try:
-            done, _pending = await asyncio.wait(
-                {reader, processor}, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()  # propaga erro de leitura/processamento
-            if duration_seconds and processor in done:
-                logger.info("teste encerrado: frames=%d processados=%d eventos=%d",
-                            self._frames_seen, self._n_processed, self._n_events)
+            while True:
+                finished = await self._run_stream(
+                    client, camera_id, decoder, duration_seconds, t0)
+                if finished:
+                    break
+                before = self._resync_before
+                self._prepare_resync()
+                logger.warning(
+                    "resync: aguardando %.0fs sem cliente no stream (idade antes %.0fs)",
+                    self.limits.capture_age_resync_wait_s, before or 0)
+                await asyncio.sleep(self.limits.capture_age_resync_wait_s)
+                if duration_seconds and time.monotonic() - t0 >= duration_seconds:
+                    break
         except asyncio.CancelledError:
             if duration_seconds:
                 logger.info("teste encerrado: frames=%d processados=%d eventos=%d",
                             self._frames_seen, self._n_processed, self._n_events)
         finally:
-            for task in (reader, processor):
-                task.cancel()
-            for task in (reader, processor):
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
             vlm_task.cancel()
             watchdog.cancel()
             self._analysis_executor.shutdown(wait=False, cancel_futures=True)

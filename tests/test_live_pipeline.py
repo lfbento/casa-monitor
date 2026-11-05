@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
+import cv2
 
 import pipeline as pl
+from capture import osd
 from capture.decoder import Frame
 from settings import DetectConfig, PipelineLimits
 from zones.roi import Zones
@@ -28,7 +31,9 @@ def _bare_pipeline() -> pl.MonitorPipeline:
     p.detect_cfg = DetectConfig()
     p.zones = Zones.load()
     p.engine = SimpleNamespace(zones=p.zones, step=lambda *a, **k: [],
-                               book=SimpleNamespace(tracks={}))
+                               book=SimpleNamespace(tracks={}),
+                               reset=lambda: setattr(
+                                   p.engine, "book", SimpleNamespace(tracks={})))
     p._latest = None
     p._prev_small = None
     p._motion_mask = None
@@ -41,6 +46,27 @@ def _bare_pipeline() -> pl.MonitorPipeline:
     p._analysis_dropped = 0
     p._analysis_deduped = 0
     p._last_alert_latency_ms = None
+    p.osd = osd.OsdClock(30.0)
+    p._last_capture_age_s = None
+    p._max_capture_age_s = None
+    p._last_captured_at = None
+    p._capture_unknown = 0
+    p._resync_requested = False
+    p._resync_before = None
+    p._last_resync_attempt = 0.0
+    p._cycle_wait_ms = deque(maxlen=10)
+    p._cycle_infer_ms = deque(maxlen=10)
+    p._cycle_step_ms = deque(maxlen=10)
+    p._reader_busy_s = 0.0
+    p._reader_frames = 0
+    p._cadence_fps = None
+    p._cadence_ts = None
+    p._cadence_n = 0
+    p._last_inference_ts = 0.0
+    p._frames_no_motion = 0
+    p._sanity_detections = 0
+    p._motion_frames = 0
+    p._win_motion_n = 0
     p._vlm_queue = asyncio.Queue(maxsize=8)
     p._vlm_prio = asyncio.Queue(maxsize=2)
     p._vlm_task = None
@@ -159,3 +185,127 @@ def test_watchdog_line_exposes_freshness_and_queues() -> None:
     assert "idade_max=180ms" in line
     assert "latência_alerta=2100ms" in line
     assert "análise=" in line
+    assert "frescor=" in line
+    assert "ocr_falhas=" in line
+    assert "cadência=" in line and "(cfg " in line
+    assert "ciclo ms p50/p95" in line
+    assert "leitura=" in line
+
+
+class _OsdDecoder:
+    def __init__(self, image, arrival_wall: float) -> None:
+        self.image = image
+        self.arrival_wall = arrival_wall
+        self.seq = 0
+
+    def feed(self, chunk: bytes):
+        self.seq += 1
+        return [Frame(image=self.image, pts=0.0, seq=self.seq,
+                      arrival_mono=time.monotonic(), arrival_wall=self.arrival_wall)]
+
+
+def _osd_frame(name: str = "osd_0800.png"):
+    from pathlib import Path
+
+    gray = cv2.imread(str(Path(__file__).parent / "fixtures" / "osd" / name),
+                      cv2.IMREAD_GRAYSCALE)
+    assert gray is not None
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def test_reader_propagates_capture_time_from_osd() -> None:
+    p = _bare_pipeline()
+    p._motion_mask = None
+    captured = pl.datetime(2026, 11, 5, 8, 37, 25).astimezone()
+    decoder = _OsdDecoder(_osd_frame(), arrival_wall=captured.timestamp() + 7)
+
+    asyncio.run(p._read_frames(_FakeClient(chunks=1), "cam", decoder))
+
+    assert p._latest is not None
+    assert p._latest.captured_at is not None
+    assert int(p._latest.capture_age_s or 0) == 7
+    assert p._latest.frame.captured_at == p._latest.captured_at
+
+
+def test_reader_leaves_capture_time_unknown_when_osd_illegible() -> None:
+    p = _bare_pipeline()
+    p._motion_mask = None
+    decoder = _OsdDecoder(_osd_frame("osd_bad.png"), arrival_wall=time.time())
+
+    asyncio.run(p._read_frames(_FakeClient(chunks=1), "cam", decoder))
+
+    assert p._latest is not None
+    assert p._latest.captured_at is None
+    assert p._latest.capture_age_s is None
+    p._take_frame(time.monotonic())
+    assert p._capture_unknown == 1
+
+
+def test_resync_is_requested_above_limit_and_honors_cooldown() -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(capture_age_resync_s=300.0)
+
+    assert p._maybe_request_resync(10.0) is False
+    assert p._resync_requested is False
+
+    assert p._maybe_request_resync(400.0) is True
+    assert p._resync_requested is True
+    assert p._resync_before == 400.0
+
+    p._resync_requested = False
+    assert p._maybe_request_resync(500.0) is False  # cooldown de 300s
+
+
+def test_prepare_resync_discards_pending_state() -> None:
+    p = _bare_pipeline()
+    p._latest = pl.FrameEnvelope(_frame(1), None, False, 0)
+    p._last_capture_age_s = 900.0
+    p._height = None
+    p.engine.book = SimpleNamespace(tracks={11: object()})
+    p._resync_before = 900.0
+
+    p._prepare_resync()
+
+    assert p._latest is None
+    assert p._last_capture_age_s is None
+    assert p._resync_before == 900.0  # preservado para o veredito pós-reconexão
+    assert not p.engine.book.tracks
+
+
+def test_resync_verdict_reports_recovered_blocked_and_unknown() -> None:
+    p = _bare_pipeline()
+    assert p._resync_verdict(3600.0, 3.0) == "recuperado"
+    assert "bloqueado" in p._resync_verdict(3600.0, 3500.0)
+    assert "bloqueado" in p._resync_verdict(3600.0, None)
+
+
+def test_reader_requests_resync_and_emits_nothing_from_stale_interval() -> None:
+    p = _bare_pipeline()
+    p._motion_mask = None
+    p.limits = PipelineLimits(capture_age_resync_s=60.0)
+    captured = pl.datetime(2026, 11, 5, 8, 37, 25).astimezone()
+    decoder = _OsdDecoder(_osd_frame(), arrival_wall=captured.timestamp() + 3600)
+
+    asyncio.run(p._read_frames(_FakeClient(chunks=1), "cam", decoder))
+
+    assert p._resync_requested is True
+    assert p._resync_before and p._resync_before > 3000
+    assert p._latest is None
+
+
+def test_motion_gate_skips_stills_and_keeps_sanity_check() -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(motion_sanity_interval_s=10.0)
+    still = pl.FrameEnvelope(_frame(1), None, False, 0)
+    moving = pl.FrameEnvelope(_frame(2), None, True, 500)
+
+    p._last_inference_ts = 0.0
+    assert p._detect_decision(still, now=1.0) == (False, False)
+    assert p._frames_no_motion == 1
+
+    # passou o intervalo de sanidade: uma detecção para provar que o gate vive
+    assert p._detect_decision(still, now=11.0) == (True, True)
+    assert p._sanity_detections == 1
+
+    assert p._detect_decision(moving, now=12.0) == (True, False)
+    assert p._motion_frames == 1

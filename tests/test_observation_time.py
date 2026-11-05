@@ -36,3 +36,36 @@ def test_event_uses_observation_time_and_records_latency(store, tmp_path, make_t
         "conf": 0.91,
         "track": 7,
     }
+
+
+def test_event_records_capture_time_and_age(store, tmp_path, make_track) -> None:
+    engine = EventEngine(Zones.load(), RulesConfig(), store, snapshot_dir=tmp_path)
+    st = make_track(track_id=11, cls_name="person")
+    st.bboxes.append((0.0, 0.0, 90.0, 90.0))
+    st.last_conf = 0.8
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    captured = datetime.now().astimezone() - timedelta(hours=5)
+    observed = datetime.now().astimezone()
+
+    engine.step(frame, [], now=0.0, observed_at=observed, captured_at=captured)
+    event_id = engine._emit("passagem_pessoa", st, "ZONA_RUA", frame)
+
+    event = store.event_by_id(event_id)
+    assert event is not None
+    assert event["captured_at"] == captured.isoformat(timespec="seconds")
+    assert event["capture_age_ms"] >= 5 * 3600 * 1000 - 2000
+
+
+def test_event_without_capture_time_stays_unknown(store, tmp_path, make_track) -> None:
+    engine = EventEngine(Zones.load(), RulesConfig(), store, snapshot_dir=tmp_path)
+    st = make_track(track_id=12, cls_name="person")
+    st.bboxes.append((0.0, 0.0, 90.0, 90.0))
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+    engine.step(frame, [], now=0.0, observed_at=datetime.now().astimezone(), captured_at=None)
+    event_id = engine._emit("passagem_pessoa", st, "ZONA_RUA", frame)
+
+    event = store.event_by_id(event_id)
+    assert event is not None
+    assert event["captured_at"] is None
+    assert event["capture_age_ms"] is None

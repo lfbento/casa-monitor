@@ -207,8 +207,16 @@ def build_structured_log(store: Store, ts_from: str, ts_to: str) -> dict:
         if faixa is not None:
             por_faixa[faixa] += 1
 
+    ages = [e["capture_age_ms"] for e in events if e.get("capture_age_ms") is not None]
+    frescor = {
+        "amostras": len(ages),
+        "desconhecidos": sum(1 for e in events if e.get("capture_age_ms") is None),
+        "min_ms": min(ages) if ages else None,
+        "max_ms": max(ages) if ages else None,
+    }
     return {
         "janela": {"de": ts_from, "ate": ts_to},
+        "frescor": frescor,
         "contagem_por_tipo": {
             "passagem_pessoa": count("passagem_pessoa"),
             "passagem_veiculo": count("passagem_veiculo"),
@@ -244,16 +252,34 @@ def _status_label(status: str | None) -> str:
     }.get(status or "", status or "—")
 
 
+def _format_freshness(ms: int | None) -> str:
+    if ms is None:
+        return "—"
+    total = max(0, int(ms / 1000))
+    hours, rest = divmod(total, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
 def _render_totals(log: dict) -> str:
     """Totais oficiais derivados da consolidação — independentes do LLM."""
     c = log["contagem_por_tipo"]
     faixa = log["eventos_por_faixa_horaria"]
+    frescor = log.get("frescor") or {}
     return (
         "\n**Resumo do período (consolidação):** "
         f"alertas={c['alerta_suspeito']}, acessos={c['acesso_casa']}, "
         f"portão={c['aproximacao_portao']}, embarques={c['embarque_desembarque']}, "
         f"veículos={c['passagem_veiculo']}, pessoas={c['passagem_pessoa']}, animais={c['animal']}. "
         f"Por faixa: {faixa}.\n"
+        f"**Frescor da captura:** mínimo={_format_freshness(frescor.get('min_ms'))}, "
+        f"máximo={_format_freshness(frescor.get('max_ms'))}, "
+        f"amostras={frescor.get('amostras', 0)}, "
+        f"sem horário de captura={frescor.get('desconhecidos', 0)}.\n"
     )
 
 
