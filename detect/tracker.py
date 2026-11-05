@@ -23,6 +23,7 @@ class TrackState:
     bboxes: deque = field(default_factory=lambda: deque(maxlen=8))    # (x1,y1,x2,y2)
     speed_px_s: float = 0.0
     total_path_px: float = 0.0
+    last_conf: float = 0.0             # confiança da última detecção do track
     zones_seen: set = field(default_factory=set)
     current_zone: str | None = None
     last_entry: str | None = None       # 'ENTRY' | 'EXIT' pendente de emitir
@@ -30,19 +31,35 @@ class TrackState:
     appearance: np.ndarray | None = None  # histograma de aparência (crop)
     best_crop: bytes | None = None    # melhor recorte visto (JPEG, bbox maior)
     best_area: float = 0.0
-    flags: set = field(default_factory=set)  # eventos já emitidos (evita duplicar)
+    entry_done: bool = False          # já registrou acesso à casa
+    gate_since: float | None = None   # início da permanência contígua no portão
+    gate_dwell_emitted: bool = False
+    gate_loiter_emitted: bool = False
+    vehicle_near_since: float | None = None   # início da proximidade contígua c/ veículo
+    vehicle_near_track: int | None = None
+    veh_exit_emitted: bool = False    # janela de nascimento do desembarque encerrada
+    loiter_veh_emitted: bool = False
+    veh_interaction_emitted: bool = False
+    finalized: bool = False
     gone_since: float | None = None
+
+    MAX_SPEED_DT = 2.0  # s — gaps maiores não entram na velocidade
 
     def update(self, det: Detection, now: float) -> None:
         cx, cy = det.center
         if self.history:
             t0, x0, y0 = self.history[-1]
-            dt = max(1e-3, now - t0)
+            dt = now - t0
             dist = ((cx - x0) ** 2 + (cy - y0) ** 2) ** 0.5
-            self.speed_px_s = 0.7 * self.speed_px_s + 0.3 * (dist / dt)
+            if dt <= self.MAX_SPEED_DT:
+                self.speed_px_s = 0.7 * self.speed_px_s + 0.3 * (dist / max(dt, 1e-3))
+            else:
+                # gap de processamento: não inventa pico de velocidade
+                self.speed_px_s = 0.0
             self.total_path_px += dist
         self.history.append((now, cx, cy))
         self.bboxes.append((det.x1, det.y1, det.x2, det.y2))
+        self.last_conf = det.conf
         self.last_seen = now
 
     def set_appearance(self, frame_bgr: np.ndarray) -> None:
@@ -73,15 +90,19 @@ class TrackState:
 class TrackBook:
     """Registro vivo de todos os tracks."""
 
-    def __init__(self, stale_seconds: float = 8.0):
+    def __init__(self, stale_seconds: float = 8.0, gap_reset_seconds: float = 10.0):
         self.tracks: dict[int, TrackState] = {}
         self.stale_seconds = stale_seconds
+        self.gap_reset_seconds = gap_reset_seconds
 
     def update(self, detections: list[Detection], frame_bgr: np.ndarray, now: float | None = None) -> list[TrackState]:
         now = time.monotonic() if now is None else now
         seen: list[TrackState] = []
         for det in detections:
             st = self.tracks.get(det.track_id)
+            if st is not None and now - st.last_seen > self.gap_reset_seconds:
+                # gap longo: o estado antigo não representa mais o objeto
+                st = None
             if st is None:
                 st = TrackState(track_id=det.track_id, cls_name=det.cls_name,
                                 first_seen=now, last_seen=now)

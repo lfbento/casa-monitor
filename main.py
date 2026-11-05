@@ -84,14 +84,20 @@ def generate_report_now(send: bool = True) -> int:
     from notifier import send as notify
     from report.daily_report import generate_report
 
-    settings.ensure_dirs()
-    store = Store()
-    path = generate_report(store)
+    try:
+        settings.ensure_dirs()
+        store = Store()
+        path = generate_report(store)
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        log.error("geração do relatório falhou: %s", err)
+        return 1
     text = path.read_text(encoding="utf-8")
     log.info("Relatório: %s (%d chars)", path, len(text))
     if send:
         ok = notify(text)
         log.info("Envio: %s", "ok" if ok else "FALHOU (veja logs do notifier)")
+        if not ok:
+            return 1
     return 0
 
 
@@ -107,16 +113,18 @@ def identify_person(event_id: int, name: str) -> int:
     if not ev:
         log.error("evento #%d não encontrado", event_id)
         return 1
-    if not ev.get("snapshot_path") or not Path(ev["snapshot_path"]).exists():
-        log.error("evento #%d sem snapshot válido", event_id)
+    crop_ref = ev.get("person_crop_path") or ev.get("snapshot_path")
+    if not crop_ref or not Path(crop_ref).exists():
+        log.error("evento #%d sem recorte/snapshot válido", event_id)
         return 1
-    hist = crop_hist(Path(ev["snapshot_path"]))
+    hist = crop_hist(Path(crop_ref))
     if hist is None:
-        log.error("não consegui extrair a aparência do snapshot")
+        log.error("não consegui extrair a aparência do recorte")
         return 1
     desc = (ev.get("vlm_description") or "")[:200]
-    pid = store.add_known_person(name, desc, ev["snapshot_path"], hist.tobytes(),
-                                 source_event_id=event_id)
+    pid = store.add_known_person(name, desc, crop_ref, hist.tobytes(),
+                                 source_event_id=event_id,
+                                 signature_source="person_crop")
     store.set_event_person_label(event_id, name)
     log.info("pessoa registrada: #%d %s (evento #%d) — eventos futuros parecidos sairão identificados",
              pid, name, event_id)
@@ -136,25 +144,34 @@ def list_people() -> int:
     return 0
 
 
+def run_scheduled_report(store) -> None:
+    """Gera e envia o relatório agendado, registrando a entrega real."""
+    from notifier import send as notify
+    from report.daily_report import generate_report
+
+    try:
+        path = generate_report(store)
+        ok = notify(path.read_text(encoding="utf-8"))
+        if ok:
+            log.info("relatório 22h enviado: %s", path)
+        else:
+            log.error("relatório 22h gerado mas a ENTREGA FALHOU: %s", path)
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        log.error("relatório 22h falhou: %s", err)
+
+
 def run_daemon() -> int:
     """Daemon 24/7: pipeline contínuo + relatório às 22h00 + manutenção 23h00."""
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     from pipeline import MonitorPipeline
-    from notifier import send as notify
-    from report.daily_report import generate_report
 
     async def _main() -> None:
         pipe = MonitorPipeline()
         scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
 
         def daily_report() -> None:
-            try:
-                path = generate_report(pipe.store)
-                notify(path.read_text(encoding="utf-8"))
-                log.info("relatório 22h enviado: %s", path)
-            except Exception as err:  # pylint: disable=broad-exception-caught
-                log.error("relatório 22h falhou: %s", err)
+            run_scheduled_report(pipe.store)
 
         scheduler.add_job(daily_report, "cron", hour=22, minute=0, id="relatorio_22h")
         scheduler.add_job(pipe.maintenance, "cron", hour=23, minute=0, id="manutencao")

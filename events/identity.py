@@ -7,6 +7,7 @@ disponível, o VLM pode ser usado como juiz (futuro).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,11 +15,74 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-MATCH_THRESHOLD = 0.85  # cosseno do histograma (roupa+aparência)
+MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.95"))  # cosseno do recorte da pessoa
+MATCH_MARGIN = float(os.getenv("MATCH_MARGIN", "0.05"))        # separação mínima sobre a 2a melhor
 
 
-def crop_hist(path: Path) -> np.ndarray | None:
-    """Histograma HSV normalizado do crop (mesma assinatura do TrackState)."""
+@dataclass
+class Match:
+    person_id: int
+    name: str
+    score: float
+
+
+@dataclass
+class MatchResult:
+    """Resultado conservador: nome apenas quando há evidência suficiente."""
+    status: str                      # 'matched' | 'unknown' | 'uncertain'
+    name: str | None = None
+    person_id: int | None = None
+    score: float = 0.0
+    second_score: float = 0.0
+
+    @property
+    def matched(self) -> bool:
+        return self.status == "matched"
+
+
+def match(hist: np.ndarray | None, known: list[dict],
+          threshold: float = MATCH_THRESHOLD,
+          margin: float = MATCH_MARGIN) -> MatchResult:
+    """Pareia recorte com pessoas conhecidas, com limiar e margem mínima.
+
+    Só assinaturas provenientes de recorte da pessoa (`person_crop`) entram.
+    Retorna 'matched' apenas com melhor candidato acima do limiar e com margem
+    suficiente sobre o segundo; 'uncertain' quando os melhores estão próximos;
+    'unknown' quando ninguém atinge o limiar.
+    """
+    if hist is None:
+        return MatchResult(status="unknown")
+    scored: list[Match] = []
+    for p in known:
+        if p.get("signature_source", "full_frame") != "person_crop":
+            continue
+        kh = p.get("hist")
+        if not kh:
+            continue
+        kvec = np.frombuffer(kh, dtype=np.float32)
+        if kvec.shape != hist.shape:
+            continue
+        score = float(np.dot(kvec, hist))
+        if score >= threshold:
+            scored.append(Match(person_id=p["id"], name=p["name"], score=score))
+    if not scored:
+        return MatchResult(status="unknown")
+    scored.sort(key=lambda m: m.score, reverse=True)
+    best = scored[0]
+    second = scored[1].score if len(scored) > 1 else 0.0
+    if len(scored) > 1 and (best.score - second) < margin:
+        return MatchResult(status="uncertain", name=best.name,
+                           person_id=best.person_id, score=best.score,
+                           second_score=second)
+    return MatchResult(status="matched", name=best.name,
+                       person_id=best.person_id, score=best.score,
+                       second_score=second)
+
+
+def crop_hist(path: Path | str | None) -> np.ndarray | None:
+    """Histograma HSV normalizado do recorte da pessoa (mesma assinatura do TrackState)."""
+    if not path:
+        return None
     try:
         import cv2
 
@@ -34,29 +98,3 @@ def crop_hist(path: Path) -> np.ndarray | None:
     except Exception as err:  # pylint: disable=broad-exception-caught
         logger.error("crop_hist falhou: %s", err)
         return None
-
-
-@dataclass
-class Match:
-    person_id: int
-    name: str
-    score: float
-
-
-def match(hist: np.ndarray | None, known: list[dict],
-          threshold: float = MATCH_THRESHOLD) -> Match | None:
-    """Melhor pareamento entre o histograma e as pessoas conhecidas."""
-    if hist is None:
-        return None
-    best: Match | None = None
-    for p in known:
-        kh = p.get("hist")
-        if not kh:
-            continue
-        kvec = np.frombuffer(kh, dtype=np.float32)
-        if kvec.shape != hist.shape:
-            continue
-        score = float(np.dot(kvec, hist))
-        if score >= threshold and (best is None or score > best.score):
-            best = Match(person_id=p["id"], name=p["name"], score=score)
-    return best

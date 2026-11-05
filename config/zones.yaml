@@ -1,29 +1,34 @@
-# Zonas de monitoramento — calibradas em 2026-10-31 (CW700S, 1280x720, olho-de-peixe)
-# Gerado por zones/calibrate_zones.py --grid + leitura visual. Ajuste com --click.
-image_size: [1280, 720]
+# Zonas de monitoramento — CW700S (olho-de-peixe)
+# CORREÇÃO 2026-10-31: o pipeline rastreia em 2560x1440 (provado por
+# capture-test + probe); as zonas originais estavam em 1280x720 (escala 2x
+# errada) — por isso acesso_casa/aproximacao_portao nunca disparavam.
+# Coordenadas = originais x2 (geometria preservada).
+image_size: [2560, 1440]
 zones:
   ZONA_RUA:
-    - [256, 0]
-    - [1024, 86]
-    - [1280, 360]
-    - [1280, 720]
-    - [656, 720]
-    - [512, 425]
-    - [320, 110]
+    - [512, 0]
+    - [2048, 172]
+    - [2560, 720]
+    - [2560, 1440]
+    - [1312, 1440]
+    - [1024, 850]
+    - [640, 220]
   ZONA_PORTAO:
-    - [0, 110]
-    - [180, 190]
-    - [560, 720]
-    - [320, 720]
-    - [0, 720]
+    - [0, 220]
+    - [360, 380]
+    - [1120, 1440]
+    - [640, 1440]
+    - [0, 1440]
   ZONA_INTERNA:
     - [0, 0]
-    - [240, 0]
-    - [200, 120]
-    - [60, 160]
-    - [0, 130]
+    - [480, 0]
+    - [400, 240]
+    - [120, 320]
+    - [0, 260]
+  # Linha reposicionada: cruza o caminho real rua→portão no meio do trajeto
+  # (estimado pela grade 2560x1440: portão ~[360,450], calçada ~[1150,720])
   LINHA_ACESSO_CASA:
-    - [240, 280]
-    - [80, 380]
+    - [690, 775]
+    - [820, 395]
 # lado de DENTRO da casa (cruzar a linha terminando nesse lado = ENTRY)
-house_side: [60, 200]
+house_side: [360, 450]

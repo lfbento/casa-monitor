@@ -46,13 +46,19 @@ class VlmResult:
     motivo: str
 
 
-def _encode_image(path: Path) -> str:
-    return base64.b64encode(path.read_bytes()).decode("ascii")
+def _encode_image(path: Path | str) -> str:
+    return base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
-def describe_event(event_type: str, snapshot_paths: list[Path], timeout: float = 60.0) -> VlmResult | None:
-    """Envia os keyframes ao VLM e devolve a análise. None se indisponível."""
-    imgs = [p for p in snapshot_paths if p.exists()][:3]
+def describe_event(event_type: str, snapshot_paths: list[Path | str],
+                   timeout: float = 60.0) -> VlmResult | None:
+    """Envia os keyframes ao VLM e devolve a análise. None se indisponível.
+
+    Aceita caminhos como `Path` ou `str` (o banco e o EventImages guardam
+    textos); normaliza na entrada para não quebrar o worker por tipo.
+    """
+    imgs = [Path(p) for p in snapshot_paths]
+    imgs = [p for p in imgs if p.exists()][:3]
     if not imgs:
         return None
     content = [{"type": "text", "text": _PROMPT.format(evento=event_type)}]

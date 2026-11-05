@@ -25,6 +25,22 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _positive_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 @dataclass
 class MilocoConfig:
     base_url: str = field(default_factory=lambda: os.getenv("MILOCO_BASE_URL", "https://localhost:8010"))
@@ -64,6 +80,19 @@ class RulesConfig:
         sh, sm = (int(x) for x in start.split(":"))
         eh, em = (int(x) for x in end.split(":"))
         return sh, sm, eh, em
+
+
+@dataclass
+class PipelineLimits:
+    """Limites de frescor do frame, fila de análise e latência de alerta."""
+    max_frame_age_s: float = field(default_factory=lambda: _positive_float("MAX_FRAME_AGE_SECONDS", 2.0))
+    alert_max_latency_s: float = field(default_factory=lambda: _positive_float("ALERT_MAX_LATENCY_SECONDS", 5.0))
+    analysis_queue_max: int = field(default_factory=lambda: _positive_int("ANALYSIS_QUEUE_MAX", 8))
+    analysis_max_age_s: float = field(default_factory=lambda: _positive_float("ANALYSIS_MAX_AGE_SECONDS", 180.0))
+    analysis_dedup_s: float = field(default_factory=lambda: _positive_float("ANALYSIS_DEDUP_SECONDS", 60.0))
+    analysis_min_area_px: int = field(default_factory=lambda: _positive_int("ANALYSIS_MIN_AREA_PX", 2500))
+    analysis_min_conf: float = field(default_factory=lambda: _positive_float("ANALYSIS_MIN_CONF", 0.5))
+    analysis_timeout_s: float = field(default_factory=lambda: _positive_float("ANALYSIS_TIMEOUT_SECONDS", 30.0))
 
 
 def ensure_dirs() -> None:

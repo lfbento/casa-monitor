@@ -6,6 +6,7 @@ PyAV cuida de agrupar NALs parciais em pacotes válidos entre chamadas.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -20,6 +21,8 @@ class Frame:
     image: np.ndarray      # BGR (formato OpenCV)
     pts: float             # timestamp em segundos (relativo ao stream)
     seq: int
+    arrival_mono: float    # monotonic no instante em que o frame ficou disponível
+    arrival_wall: float    # time.time() no mesmo instante (horário de observação)
 
 
 class H264StreamDecoder:
@@ -45,7 +48,13 @@ class H264StreamDecoder:
                 self._size = (frame.width, frame.height)
                 t = float(frame.time) if frame.time is not None else 0.0
                 self._seq += 1
-                yield Frame(image=img, pts=t, seq=self._seq)
+                yield Frame(
+                    image=img,
+                    pts=t,
+                    seq=self._seq,
+                    arrival_mono=time.monotonic(),
+                    arrival_wall=time.time(),
+                )
 
     @property
     def size(self) -> tuple[int, int] | None:

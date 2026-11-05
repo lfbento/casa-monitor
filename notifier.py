@@ -45,24 +45,40 @@ def _chunks(text: str, size: int = 3900) -> list[str]:
     return parts or [""]
 
 
+def _http_client() -> httpx.Client:
+    """Cliente HTTP com IPv4 forçado e timeout curto.
+
+    O hang de ~60s nos uploads do Telegram era o httpx caindo no buraco
+    negro de IPv6 (conexão pendurada até o timeout) — atrasando alertas em
+    1 minuto inteiro. IPv4 + timeout curto + retry limitam o pior caso
+    a poucos segundos.
+    """
+    return httpx.Client(
+        timeout=httpx.Timeout(12.0, connect=5.0),
+        transport=httpx.HTTPTransport(local_address="0.0.0.0"),
+    )
+
+
 def send_telegram(text: str) -> bool:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
         logger.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID não configurados")
         return False
     ok = True
     for part in _chunks(text):
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT, "text": part},
-                timeout=30,
-            )
-            ok = ok and resp.status_code == 200
-            if resp.status_code != 200:
-                logger.error("Telegram HTTP %s: %s", resp.status_code, resp.text[:200])
-        except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.error("Telegram falhou: %s", err)
-            ok = False
+        for attempt in (1, 2):
+            try:
+                with _http_client() as client:
+                    resp = client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": TELEGRAM_CHAT, "text": part},
+                    )
+                ok = ok and resp.status_code == 200
+                if resp.status_code != 200:
+                    logger.error("Telegram HTTP %s: %s", resp.status_code, resp.text[:200])
+                break
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                logger.error("Telegram falhou (tentativa %d): %s", attempt, err)
+                ok = False
     return ok
 
 
@@ -75,19 +91,19 @@ def send_photo(image_path: str, caption: str) -> bool:
         logger.error("foto não existe: %s", image_path)
         return send(caption)
     if CHANNEL == "telegram" and TELEGRAM_TOKEN and TELEGRAM_CHAT:
-        try:
-            with p.open("rb") as fh:
-                resp = httpx.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                    data={"chat_id": TELEGRAM_CHAT, "caption": caption[:1000]},
-                    files={"photo": (p.name, fh, "image/jpeg")},
-                    timeout=60,
-                )
-            if resp.status_code == 200:
-                return True
-            logger.error("sendPhoto HTTP %s: %s", resp.status_code, resp.text[:200])
-        except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.error("sendPhoto falhou: %s", err)
+        for attempt in (1, 2):
+            try:
+                with p.open("rb") as fh, _http_client() as client:
+                    resp = client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                        data={"chat_id": TELEGRAM_CHAT, "caption": caption[:1000]},
+                        files={"photo": (p.name, fh, "image/jpeg")},
+                    )
+                if resp.status_code == 200:
+                    return True
+                logger.error("sendPhoto HTTP %s: %s", resp.status_code, resp.text[:200])
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                logger.error("sendPhoto falhou (tentativa %d): %s", attempt, err)
     # fallback: texto (com o caminho da foto)
     return send(f"{caption}\n\n📷 {image_path}")
 

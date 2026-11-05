@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -25,7 +26,10 @@ CREATE TABLE IF NOT EXISTS events (
   vlm_description TEXT,
   risk_level TEXT DEFAULT 'baixo',
   snapshot_path TEXT,
-  meta TEXT
+  meta TEXT,
+  person_crop_path TEXT,
+  observed_at TEXT,
+  detect_latency_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS house_sessions (
   id INTEGER PRIMARY KEY,
@@ -35,7 +39,11 @@ CREATE TABLE IF NOT EXISTS house_sessions (
   duration_minutes INTEGER,
   status TEXT NOT NULL DEFAULT 'INSIDE',
   entry_snapshot TEXT,
-  exit_snapshot TEXT
+  exit_snapshot TEXT,
+  entry_track_id INTEGER,
+  appearance_hist BLOB,
+  last_seen_time TEXT,
+  match_status TEXT
 );
 CREATE TABLE IF NOT EXISTS known_people (
   id INTEGER PRIMARY KEY,
@@ -44,7 +52,8 @@ CREATE TABLE IF NOT EXISTS known_people (
   crop_path TEXT,
   hist BLOB,
   source_event_id INTEGER,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  signature_source TEXT NOT NULL DEFAULT 'person_crop'
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp_start);
 CREATE INDEX IF NOT EXISTS idx_sessions_entry ON house_sessions(entry_time);
@@ -60,6 +69,16 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _stale_cutoff(ref_iso: str) -> str:
+    """Instante a partir do qual uma sessão sem confirmação é considerada STALE."""
+    hours = float(os.getenv("HOUSE_SESSION_STALE_HOURS", "24"))
+    try:
+        ref = datetime.fromisoformat(ref_iso)
+    except ValueError:
+        ref = datetime.now().astimezone()
+    return (ref - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
 class Store:
     def __init__(self, path: Path = DB_PATH):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,25 +89,51 @@ class Store:
         self._migrate()
 
     def _migrate(self) -> None:
-        """Migrações simples de schema (idempotentes)."""
-        try:
-            self._conn.execute("ALTER TABLE events ADD COLUMN person_label TEXT")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # coluna já existe
+        """Migrações aditivas e idempotentes; erros inesperados interrompem o startup."""
+        additions = {
+            "events": {
+                "person_label": "TEXT",
+                "person_crop_path": "TEXT",
+                "observed_at": "TEXT",
+                "detect_latency_ms": "INTEGER",
+            },
+            "house_sessions": {
+                "entry_track_id": "INTEGER",
+                "appearance_hist": "BLOB",
+                "last_seen_time": "TEXT",
+                "match_status": "TEXT",
+            },
+            "known_people": {
+                "signature_source": "TEXT NOT NULL DEFAULT 'full_frame'",
+            },
+        }
+        for table, columns in additions.items():
+            existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        self._conn.execute(
+            "UPDATE house_sessions SET last_seen_time=entry_time WHERE last_seen_time IS NULL"
+        )
+        self._conn.commit()
 
     # ---------- eventos ----------
     def add_event(self, event_type: str, track_id: Optional[int], zone: Optional[str],
                   ts_start: Optional[str] = None, ts_end: Optional[str] = None,
                   vlm_description: Optional[str] = None, risk_level: str = "baixo",
-                  snapshot_path: Optional[str] = None, meta: Optional[str] = None) -> int:
+                  snapshot_path: Optional[str] = None, meta: Optional[str] = None,
+                  person_crop_path: Optional[str] = None,
+                  observed_at: Optional[str] = None,
+                  detect_latency_ms: Optional[int] = None) -> int:
         assert event_type in EVENT_TYPES, f"event_type inválido: {event_type}"
         cur = self._conn.execute(
             "INSERT INTO events (timestamp_start, timestamp_end, event_type, track_id, zone,"
-            " vlm_description, risk_level, snapshot_path, meta)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            " vlm_description, risk_level, snapshot_path, meta, person_crop_path,"
+            " observed_at, detect_latency_ms)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts_start or _now_iso(), ts_end, event_type, track_id, zone,
-             vlm_description, risk_level, snapshot_path, meta),
+             vlm_description, risk_level, snapshot_path, meta, person_crop_path,
+             observed_at, detect_latency_ms),
         )
         self._conn.commit()
         return int(cur.lastrowid)
@@ -112,17 +157,30 @@ class Store:
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     # ---------- sessões da casa ----------
-    def open_session(self, person_desc: str, entry_time: str, entry_snapshot: Optional[str]) -> int:
+    def open_session(self, person_desc: str, entry_time: str, entry_snapshot: Optional[str],
+                     entry_track_id: Optional[int] = None,
+                     appearance_hist: Optional[bytes] = None,
+                     status: str = "INSIDE",
+                     match_status: Optional[str] = None,
+                     last_seen_time: Optional[str] = None) -> int:
         cur = self._conn.execute(
-            "INSERT INTO house_sessions (person_label_or_description, entry_time, entry_snapshot, status)"
-            " VALUES (?,?,?, 'INSIDE')",
-            (person_desc, entry_time, entry_snapshot),
+            "INSERT INTO house_sessions (person_label_or_description, entry_time, entry_snapshot,"
+            " status, entry_track_id, appearance_hist, last_seen_time, match_status)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (person_desc, entry_time, entry_snapshot, status,
+             entry_track_id, appearance_hist, last_seen_time or entry_time, match_status),
         )
         self._conn.commit()
         return int(cur.lastrowid)
 
+    def touch_session(self, session_id: int, seen_time: str) -> None:
+        self._conn.execute(
+            "UPDATE house_sessions SET last_seen_time=? WHERE id=?", (seen_time, session_id))
+        self._conn.commit()
+
     def close_session(self, session_id: int, exit_time: str, exit_snapshot: Optional[str],
-                      person_desc: Optional[str] = None) -> None:
+                      person_desc: Optional[str] = None,
+                      match_status: Optional[str] = None) -> None:
         cur = self._conn.execute("SELECT entry_time FROM house_sessions WHERE id=?", (session_id,))
         row = cur.fetchone()
         if not row:
@@ -130,47 +188,65 @@ class Store:
         entry = datetime.fromisoformat(row[0])
         exit_ = datetime.fromisoformat(exit_time)
         minutes = int((exit_ - entry).total_seconds() // 60)
+        sets = "exit_time=?, exit_snapshot=?, duration_minutes=?, status='COMPLETED', match_status=?"
+        args: list = [exit_time, exit_snapshot, minutes, match_status]
         if person_desc:
-            self._conn.execute(
-                "UPDATE house_sessions SET exit_time=?, exit_snapshot=?, duration_minutes=?,"
-                " status='COMPLETED', person_label_or_description=? WHERE id=?",
-                (exit_time, exit_snapshot, minutes, person_desc, session_id))
-        else:
-            self._conn.execute(
-                "UPDATE house_sessions SET exit_time=?, exit_snapshot=?, duration_minutes=?,"
-                " status='COMPLETED' WHERE id=?",
-                (exit_time, exit_snapshot, minutes, session_id))
+            sets += ", person_label_or_description=?"
+            args.append(person_desc)
+        args.append(session_id)
+        self._conn.execute(f"UPDATE house_sessions SET {sets} WHERE id=?", args)
         self._conn.commit()
 
-    def open_sessions(self) -> list[dict]:
+    def open_sessions(self, ts_to: Optional[str] = None) -> list[dict]:
+        """Sessões ativas no instante ts_to (ou agora), com estado temporal calculado."""
+        ref = ts_to or _now_iso()
         cur = self._conn.execute(
-            "SELECT id, person_label_or_description, entry_time, entry_snapshot"
-            " FROM house_sessions WHERE status='INSIDE' ORDER BY entry_time")
+            "SELECT id, person_label_or_description, entry_time, exit_time, entry_snapshot,"
+            " entry_track_id, appearance_hist, last_seen_time, status, match_status"
+            " FROM house_sessions"
+            " WHERE entry_time <= ? AND (exit_time IS NULL OR exit_time > ?)"
+            " ORDER BY entry_time",
+            (ref, ref))
         cols = [c[0] for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        stale_cutoff = _stale_cutoff(ref)
+        for r in rows:
+            if r.get("exit_time") is None:
+                last_seen = r.get("last_seen_time") or r["entry_time"]
+                r["status"] = "STALE" if last_seen < stale_cutoff else "INSIDE"
+            else:
+                r["status"] = "INSIDE"  # ainda estava dentro no instante consultado
+        return rows
 
     def sessions_between(self, ts_from: str, ts_to: str) -> list[dict]:
+        """Sessões cuja vigência se sobrepõe à janela [ts_from, ts_to)."""
         cur = self._conn.execute(
             "SELECT id, person_label_or_description, entry_time, exit_time, duration_minutes,"
-            " status, entry_snapshot, exit_snapshot FROM house_sessions"
-            " WHERE entry_time >= ? AND entry_time < ? ORDER BY entry_time",
-            (ts_from, ts_to))
+            " status, entry_snapshot, exit_snapshot, match_status FROM house_sessions"
+            " WHERE entry_time < ? AND COALESCE(exit_time, ?) > ? ORDER BY entry_time",
+            (ts_to, ts_to, ts_from))
         cols = [c[0] for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for r in rows:
+            if r.get("status") == "INSIDE" and r.get("entry_time", "") < _stale_cutoff(ts_to):
+                r["status"] = "STALE"
+        return rows
 
     # ---------- pessoas conhecidas ----------
     def add_known_person(self, name: str, description: str, crop_path: str,
-                         hist: bytes, source_event_id: Optional[int] = None) -> int:
+                         hist: bytes, source_event_id: Optional[int] = None,
+                         signature_source: str = "person_crop") -> int:
         cur = self._conn.execute(
-            "INSERT INTO known_people (name, description, crop_path, hist, source_event_id, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (name, description, crop_path, hist, source_event_id, _now_iso()))
+            "INSERT INTO known_people (name, description, crop_path, hist, source_event_id,"
+            " created_at, signature_source) VALUES (?,?,?,?,?,?,?)",
+            (name, description, crop_path, hist.tobytes() if hasattr(hist, "tobytes") else hist,
+             source_event_id, _now_iso(), signature_source))
         self._conn.commit()
         return int(cur.lastrowid)
 
     def known_people(self) -> list[dict]:
         cur = self._conn.execute(
-            "SELECT id, name, description, crop_path, hist, source_event_id, created_at"
+            "SELECT id, name, description, crop_path, hist, source_event_id, created_at, signature_source"
             " FROM known_people ORDER BY name")
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -178,7 +254,8 @@ class Store:
     def event_by_id(self, event_id: int) -> Optional[dict]:
         cur = self._conn.execute(
             "SELECT id, timestamp_start, event_type, track_id, zone, vlm_description,"
-            " risk_level, snapshot_path, meta, person_label FROM events WHERE id=?", (event_id,))
+            " risk_level, snapshot_path, meta, person_label, person_crop_path,"
+            " observed_at, detect_latency_ms FROM events WHERE id=?", (event_id,))
         row = cur.fetchone()
         if not row:
             return None

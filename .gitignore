@@ -6,3 +6,4 @@ data/
 reports/
 *.db
 *.pt
+.omp/
