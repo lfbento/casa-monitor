@@ -80,6 +80,9 @@ def test_freshness_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert limits.passage_merge_s == 5.0
     assert limits.passage_merge_distance_px == 200
     assert limits.passage_min_path_px == 40
+    assert limits.miloco_auto_restart is True
+    assert limits.miloco_container == "miloco"
+    assert limits.miloco_restart_cooldown_s == 1800.0
 
 
 def test_freshness_invalid_values_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,3 +97,6 @@ def test_freshness_invalid_values_fall_back(monkeypatch: pytest.MonkeyPatch) -> 
     assert limits.capture_age_fail_s == 60.0
     assert limits.track_min_hits == 3
     assert limits.passage_min_path_px == 40
+    assert limits.miloco_auto_restart is True
+    assert limits.miloco_container == "miloco"
+    assert limits.miloco_restart_cooldown_s == 1800.0

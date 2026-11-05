@@ -97,3 +97,18 @@ def test_totals_include_capture_freshness():
     assert "mínimo=2s" in text
     assert "máximo=5h00m" in text
     assert "sem horário de captura=2" in text
+
+
+def test_structured_log_is_json_serializable_with_open_sessions(store):
+    import json
+    from datetime import datetime
+
+    from report.daily_report import build_structured_log
+
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    store.open_session("pessoa", now, None, appearance_hist=b"\x01\x02")
+
+    log = build_structured_log(store, "2020-01-01T00:00:00-03:00", now)
+
+    assert all("appearance_hist" not in s for s in log["ainda_dentro_agora"])
+    json.dumps(log)  # não pode levantar TypeError

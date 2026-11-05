@@ -10,6 +10,7 @@ import contextlib
 import functools
 import json
 import logging
+import subprocess
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -103,6 +104,9 @@ class MonitorPipeline:
         self._resync_requested = False
         self._resync_before: Optional[float] = None
         self._last_resync_attempt = 0.0
+        self._last_container_restart = 0.0
+        self._resync_check_deadline: Optional[float] = None
+        self._resync_min_age: Optional[float] = None
         # ---- instrumentação do ciclo (perfil de throughput) ----
         self._cycle_wait_ms: deque = deque(maxlen=600)
         self._cycle_infer_ms: deque = deque(maxlen=600)
@@ -573,6 +577,68 @@ class MonitorPipeline:
         self._last_captured_at = None
         self.osd.reset()
 
+    def _restart_command(self) -> list[str]:
+        import shlex
+        import shutil
+
+        container = shlex.quote(self.limits.miloco_container)
+        # a unit de usuário não herda o grupo docker; `sg` troca o grupo do
+        # subprocesso sem exigir re-login (o container reinicia via socket)
+        if shutil.which("sg"):
+            return ["sg", "docker", "-c", f"docker restart {container}"]
+        return ["docker", "restart", self.limits.miloco_container]
+
+    def _should_restart_container(self, now: Optional[float] = None) -> bool:
+        if not self.limits.miloco_auto_restart:
+            return False
+        now = time.monotonic() if now is None else now
+        return now - self._last_container_restart >= self.limits.miloco_restart_cooldown_s
+
+    async def _attempt_container_restart(self) -> bool:
+        """Backlog sobreviveu ao resync: reinicia o Miloco para recriar a sessão P2P."""
+        now = time.monotonic()
+        if not self._should_restart_container(now):
+            logger.error("frescura persistente: auto-restart desabilitado ou em cooldown")
+            return False
+        self._last_container_restart = now
+        cmd = self._restart_command()
+        logger.error("frescura persistente: reiniciando %s para zerar o backlog da câmera",
+                     self.limits.miloco_container)
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=120)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.error("restart do Miloco falhou: %s", err)
+            return False
+        if proc.returncode != 0:
+            logger.error("restart do Miloco falhou (%s): %s", proc.returncode,
+                         (proc.stderr or "").strip()[:300])
+            return False
+        logger.warning("Miloco reiniciado; aguardando reconexão do stream")
+        self.osd.reset()
+        self._resync_before = None
+        return True
+
+    def _note_resync_age(self, age: Optional[float],
+                         now: float) -> Optional[tuple[str, float, Optional[float]]]:
+        """Após reconectar, espera a fonte estabilizar antes de julgar o resync."""
+        if self._resync_before is None:
+            return None
+        if self._resync_check_deadline is None:
+            self._resync_check_deadline = now + self.limits.capture_age_resync_settle_s
+            self._resync_min_age = age
+            return None
+        if age is not None:
+            self._resync_min_age = min(self._resync_min_age or age, age)
+        if now < self._resync_check_deadline:
+            return None
+        verdict = self._resync_verdict(self._resync_before, self._resync_min_age)
+        result = (verdict, self._resync_before, self._resync_min_age)
+        self._resync_before = None
+        self._resync_check_deadline = None
+        self._resync_min_age = None
+        return result
+
     def _resync_verdict(self, before: Optional[float], after: Optional[float]) -> str:
         if after is None:
             return "bloqueado (sem leitura de OSD após reconectar)"
@@ -622,15 +688,17 @@ class MonitorPipeline:
                 captured_at, capture_age = self.osd.observe(
                     frame.image, frame.arrival_wall, frame.arrival_mono)
                 if self._resync_before is not None and captured_at is not None:
-                    verdict = self._resync_verdict(self._resync_before, capture_age)
-                    if verdict == "recuperado":
-                        logger.warning("resync recuperado: idade %.0fs -> %.0fs",
-                                       self._resync_before, capture_age or 0)
-                    else:
-                        logger.error("resync %s: idade antes=%.0fs depois=%s",
-                                     verdict, self._resync_before,
-                                     "?" if capture_age is None else f"{capture_age:.0f}s")
-                    self._resync_before = None
+                    result = self._note_resync_age(capture_age, time.monotonic())
+                    if result is not None:
+                        verdict, before, best = result
+                        if verdict == "recuperado":
+                            logger.warning("resync recuperado: idade mínima %s (antes %.0fs)",
+                                           "?" if best is None else f"{best:.0f}s", before)
+                        else:
+                            logger.error("resync %s: idade antes=%.0fs depois=%s",
+                                         verdict, before,
+                                         "?" if best is None else f"{best:.0f}s")
+                            await self._attempt_container_restart()
                 if self._maybe_request_resync(capture_age):
                     self._latest = None
                     return

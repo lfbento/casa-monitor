@@ -102,6 +102,8 @@ class PipelineLimits:
         default_factory=lambda: _positive_float("CAPTURE_AGE_RESYNC_SECONDS", 300.0))
     capture_age_resync_wait_s: float = field(
         default_factory=lambda: _positive_float("CAPTURE_AGE_RESYNC_WAIT_SECONDS", 10.0))
+    capture_age_resync_settle_s: float = field(
+        default_factory=lambda: _positive_float("CAPTURE_AGE_RESYNC_SETTLE_SECONDS", 60.0))
     # ---- cadência e gate de movimento ----
     detect_min_effective_ratio: float = field(
         default_factory=lambda: _positive_float("DETECT_MIN_EFFECTIVE_RATIO", 0.5))
@@ -116,6 +118,11 @@ class PipelineLimits:
         default_factory=lambda: _positive_int("PASSAGE_MERGE_DISTANCE_PX", 200))
     passage_min_path_px: int = field(
         default_factory=lambda: _positive_int("PASSAGE_MIN_PATH_PX", 40))
+    # ---- recuperação da fonte (Miloco) quando o backlog sobrevive ao resync ----
+    miloco_auto_restart: bool = field(default_factory=lambda: _bool("MILOCO_AUTO_RESTART", True))
+    miloco_container: str = field(default_factory=lambda: os.getenv("MILOCO_CONTAINER", "miloco"))
+    miloco_restart_cooldown_s: float = field(
+        default_factory=lambda: _positive_float("MILOCO_RESTART_COOLDOWN_SECONDS", 1800.0))
 
 
 def ensure_dirs() -> None:

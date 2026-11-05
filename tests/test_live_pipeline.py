@@ -54,6 +54,9 @@ def _bare_pipeline() -> pl.MonitorPipeline:
     p._resync_requested = False
     p._resync_before = None
     p._last_resync_attempt = 0.0
+    p._last_container_restart = 0.0
+    p._resync_check_deadline = None
+    p._resync_min_age = None
     p._cycle_wait_ms = deque(maxlen=10)
     p._cycle_infer_ms = deque(maxlen=10)
     p._cycle_step_ms = deque(maxlen=10)
@@ -309,3 +312,87 @@ def test_motion_gate_skips_stills_and_keeps_sanity_check() -> None:
 
     assert p._detect_decision(moving, now=12.0) == (True, False)
     assert p._motion_frames == 1
+
+
+def test_auto_restart_disabled_and_cooldown() -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(miloco_auto_restart=False)
+
+    assert p._should_restart_container(now=10_000.0) is False
+
+    p.limits = PipelineLimits(miloco_auto_restart=True, miloco_restart_cooldown_s=1800.0)
+    p._last_container_restart = 0.0
+    p._resync_check_deadline = None
+    p._resync_min_age = None
+    assert p._should_restart_container(now=1800.0) is True
+    p._last_container_restart = 1000.0
+    assert p._should_restart_container(now=2000.0) is False
+
+
+def test_restart_command_uses_configured_container() -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(miloco_container="miloco-test")
+
+    cmd = p._restart_command()
+    assert "miloco-test" in cmd[-1]
+    assert cmd[:3] == ["sg", "docker", "-c"]
+
+
+def test_attempt_container_restart_runs_once_and_clears_verdict(monkeypatch) -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(miloco_auto_restart=True, miloco_restart_cooldown_s=1800.0)
+    p._resync_before = 500.0
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(pl.subprocess, "run", fake_run)
+
+    assert asyncio.run(p._attempt_container_restart()) is True
+    assert calls and "docker restart miloco" in calls[0][-1]
+    assert p._resync_before is None
+    assert asyncio.run(p._attempt_container_restart()) is False
+    assert len(calls) == 1
+
+
+def test_attempt_container_restart_reports_failure(monkeypatch) -> None:
+    p = _bare_pipeline()
+
+    class _Proc:
+        returncode = 1
+        stderr = "permission denied"
+
+    monkeypatch.setattr(pl.subprocess, "run", lambda cmd, **kw: _Proc())
+
+    assert asyncio.run(p._attempt_container_restart()) is False
+
+
+def test_resync_settle_window_waits_and_judges_minimum() -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(capture_age_resync_settle_s=60.0, capture_age_warn_s=30.0)
+    p._resync_before = 480.0
+
+    assert p._note_resync_age(480.0, now=0.0) is None       # abre a janela
+    assert p._note_resync_age(400.0, now=30.0) is None      # ainda dentro da janela
+    result = p._note_resync_age(2.0, now=61.0)               # estabilizou
+    assert result is not None
+    verdict, before, best = result
+    assert verdict == "recuperado" and before == 480.0 and best == 2.0
+    assert p._resync_before is None
+
+
+def test_resync_settle_window_judges_blocked_when_never_fresh() -> None:
+    p = _bare_pipeline()
+    p.limits = PipelineLimits(capture_age_resync_settle_s=60.0, capture_age_warn_s=30.0)
+    p._resync_before = 480.0
+
+    p._note_resync_age(480.0, now=0.0)
+    result = p._note_resync_age(470.0, now=61.0)
+    assert result is not None
+    assert result[0] != "recuperado"

@@ -87,7 +87,7 @@ Se `ffmpeg` continuar vivo, outro cliente mantém o stream — feche a aba do Mi
 docker restart miloco   # recria a instância da câmera e zera o backlog residual
 ```
 
-O ciclo de resync automático (`CAPTURE_AGE_RESYNC_SECONDS`, espera `CAPTURE_AGE_RESYNC_WAIT_SECONDS`) faz o teardown/reconexão sozinho; quando o backlog é da instância da câmera ele registra `resync bloqueado` — nesse caso, o restart do container é a intervenção manual (o serviço não executa docker por conta própria).
+O ciclo de resync automático (`CAPTURE_AGE_RESYNC_SECONDS`, espera `CAPTURE_AGE_RESYNC_WAIT_SECONDS`) faz o teardown/reconexão sozinho. Depois de reconectar, ele aguarda `CAPTURE_AGE_RESYNC_SETTLE_SECONDS` e usa a **menor** idade observada na janela como veredito — o backlog pode levar até ~1 min para drenar, e o veredito precoce reiniciava o stream sem necessidade. Se a idade continuar alta (instância da câmera), o serviço reinicia o container automaticamente (`MILOCO_AUTO_RESTART=true`, container em `MILOCO_CONTAINER`, no máximo uma vez a cada `MILOCO_RESTART_COOLDOWN_SECONDS`, via `sg docker` por a unit de usuário não herdar o grupo) e registra `Miloco reiniciado`. Desligue `MILOCO_AUTO_RESTART` para voltar ao procedimento manual; o restart do container também pode ser feito à mão quando o auto-restart falhar (permissão do docker, container com outro nome).
 
 **Checagem rotineira do buffer:**
 

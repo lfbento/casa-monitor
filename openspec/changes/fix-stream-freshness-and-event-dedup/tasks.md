@@ -20,7 +20,7 @@
 - [x] 3.1 Documentar a causa raiz medida (processo Python do Miloco com 5,10 GB de buffer, `stdin` do ffmpeg sem `drain`/teto, saída em 2560 px sem acompanhar 25 fps) e o procedimento de recuperação imediata: fechar todos os clientes do stream, parar o `casa-monitor` por ≥10 s, confirmar a morte do ffmpeg e a queda do RSS, religar e medir a idade (verificação: procedimento executado uma vez, idade de captura volta ao normal e o comando `docker top miloco` confere o RSS).
 - [x] 3.2 Expor no decoder a taxa `Δpts/Δwall` e sinalizar reprodução fora de 1× sem depender do OSD (verificação: teste com sequência sintética de PTS em 1× e em 1,1× classifica corretamente).
 - [x] 3.3 Implementar o ciclo de resync no cliente: ao exceder `CAPTURE_AGE_RESYNC_SECONDS`, fechar o WS, aguardar `CAPTURE_AGE_RESYNC_WAIT_SECONDS`, reconectar, medir a idade antes/depois e registrar `recuperado` ou `bloqueado por outro cliente`; conteúdo do intervalo MUST NOT gerar evento (verificação: testes com cliente simulado cobrem teardown bem-sucedido, teardown impedido e ausência de eventos do intervalo).
-- [ ] 3.4 Aplicar o patch do Miloco em `~/.local/opt/miloco-fix/deploy/patched/h264_transcoder.py`: teto de buffer com descarte até o próximo keyframe e largura de saída sustentável (1920 ou 1280), mediante aprovação e reinício do transcode (verificação: após 30 min, RSS do Miloco estável abaixo do teto, idade de captura dentro do limite e stream sem queda).
+- [x] 3.4 Aplicar o patch do Miloco em `~/.local/opt/miloco-fix/deploy/patched/h264_transcoder.py`: teto de buffer com descarte até o próximo keyframe e largura de saída sustentável (1920 ou 1280), mediante aprovação e reinício do transcode (verificação: após 30 min, RSS do Miloco estável abaixo do teto, idade de captura dentro do limite e stream sem queda).
 - [x] 3.5 Incluir na rotina de operação a checagem do buffer do Miloco (RSS do processo Python e do ffmpeg) e o limiar de intervenção (verificação: comando documentado roda como escrito e produz os dois valores).
 
 ## 4. Throughput e cadência efetiva
@@ -48,7 +48,7 @@
 - [x] 7.1 Rodar `.venv/bin/python -m pytest -q` completo e corrigir regressões (verificação: suíte verde, incluindo os testes novos).
 - [x] 7.2 Executar `python main.py --detect-test --seconds 60` e conferir idade de captura exibida, cadência efetiva e ausência de eventos a partir de conteúdo descartado (verificação: saída do comando e linhas do log).
 - [x] 7.3 Atualizar `README.md` com frescor de captura, limites, resync, cadência efetiva, gate de movimento e agregação de passagem; corrigir a afirmação de OSD ~1 h atrás (verificação: comandos e nomes de configuração documentados conferem com o código).
-- [ ] 7.4 Reiniciar o serviço e acompanhar 30 min de produção: frescor dentro do limite após a recuperação, watchdog com os novos campos, nenhum alerta apresentando conteúdo atrasado como recente (verificação: linhas de log e um alerta real conferidos).
+- [x] 7.4 Reiniciar o serviço e acompanhar 30 min de produção: frescor dentro do limite após a recuperação, watchdog com os novos campos, nenhum alerta apresentando conteúdo atrasado como recente (verificação: linhas de log e um alerta real conferidos).
 
 ## Workflow follow-up
 

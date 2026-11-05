@@ -192,11 +192,17 @@ def _project_log_for_llm(log: dict, max_chars: int = REPORT_LLM_MAX_CHARS) -> st
     return serialized if len(serialized) <= max_chars else "{}"
 
 
+def _json_safe_sessions(rows: list[dict]) -> list[dict]:
+    """Remove BLOBs (appearance_hist) — o relatório nunca serializa bytes."""
+    return [{k: v for k, v in row.items() if not isinstance(v, (bytes, bytearray))}
+            for row in rows]
+
+
 def build_structured_log(store: Store, ts_from: str, ts_to: str) -> dict:
     """Consolidação SQL exata — o que a LLM recebe (nada de adivinhação)."""
     events = store.events_between(ts_from, ts_to)
-    sessions = store.sessions_between(ts_from, ts_to)
-    open_now = store.open_sessions(ts_to)
+    sessions = _json_safe_sessions(store.sessions_between(ts_from, ts_to))
+    open_now = _json_safe_sessions(store.open_sessions(ts_to))
 
     def count(tipo: str) -> int:
         return sum(1 for e in events if e["event_type"] == tipo)
