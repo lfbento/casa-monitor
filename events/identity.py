@@ -79,6 +79,37 @@ def match(hist: np.ndarray | None, known: list[dict],
                        second_score=second)
 
 
+def identify(crop_path, known: list[dict]) -> MatchResult:
+    """Identifica por ROsto primeiro (ArcFace local), histograma como reserva.
+
+    Rosto imune a roupa/luz/boné; o histograma HSV cobre quando não há
+    rosto visível (máscara, costas, ângulo). Nada sai da máquina.
+    """
+    try:
+        from events.faceid import face_embed, match_face
+        mf = match_face(face_embed(crop_path), known)
+        if mf and mf["decisive"]:
+            return MatchResult(status="matched", name=mf["name"],
+                               person_id=mf["person_id"], score=mf["score"],
+                               second_score=mf["second"])
+        hist = crop_hist(crop_path)
+        m = match(hist, known)
+        # histograma NUNCA afirma nome sozinho (já confundiu mãe/Patrícia):
+        # rebaixa para 'uncertain' — só o rosto pode fechar 'matched'
+        if m.status == "matched":
+            return MatchResult(status="uncertain", name=m.name,
+                               person_id=m.person_id, score=m.score,
+                               second_score=m.second_score)
+        if m.status == "unknown" and mf:
+            return MatchResult(status="uncertain", name=mf["name"],
+                               person_id=mf["person_id"], score=mf["score"],
+                               second_score=mf["second"])
+        return m
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        logger.warning("identify falhou (%s) — caindo no histograma", err)
+        return match(crop_hist(crop_path), known)
+
+
 def crop_hist(path: Path | str | None) -> np.ndarray | None:
     """Histograma HSV normalizado do recorte da pessoa (mesma assinatura do TrackState)."""
     if not path:

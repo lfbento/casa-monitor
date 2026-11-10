@@ -121,13 +121,17 @@ def identify_person(event_id: int, name: str) -> int:
     if hist is None:
         log.error("não consegui extrair a aparência do recorte")
         return 1
+    from events.faceid import face_embed
+    emb = face_embed(Path(crop_ref))
     desc = (ev.get("vlm_description") or "")[:200]
     pid = store.add_known_person(name, desc, crop_ref, hist.tobytes(),
                                  source_event_id=event_id,
-                                 signature_source="person_crop")
+                                 signature_source="person_crop",
+                                 face_emb=emb.tobytes() if emb is not None else None)
     store.set_event_person_label(event_id, name)
-    log.info("pessoa registrada: #%d %s (evento #%d) — eventos futuros parecidos sairão identificados",
-             pid, name, event_id)
+    log.info("pessoa registrada: #%d %s (evento #%d) [%s] — eventos futuros sairão identificados",
+             pid, name, event_id,
+             "rosto ✓ ArcFace" if emb is not None else "sem rosto — só histograma")
     return 0
 
 

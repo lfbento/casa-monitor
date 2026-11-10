@@ -81,6 +81,10 @@ class MonitorPipeline:
         # viram UM alerta — spam satura o Telegram e atrasa a entrega de todos
         self._alert_last: dict = {}
         self._vlm_task = None
+        self._gait_seq: dict = {}          # projeto marcha: track -> frames salvos
+        self._gait_last_save = 0.0
+        self._boot_mono = time.monotonic()  # watchdog de stream mudo
+        self._mute_notified = False
         # ---- frescor e métricas do pipeline ----
         self._latest: Optional[FrameEnvelope] = None
         self._prev_small = None
@@ -302,8 +306,9 @@ class MonitorPipeline:
         self._set_alert_state(event_id, "pending")
         ev = self.store.event_by_id(event_id) or {}
         try:
-            hist = await asyncio.to_thread(crop_hist, imgs.person_crop)
-            m = match(hist, self.store.known_people())
+            from events.identity import identify
+            m = await asyncio.to_thread(identify, imgs.person_crop,
+                                        self.store.known_people())
             if m.matched:
                 quem = f"{m.name} (conhecido, {m.score:.0%})"
                 self.store.set_event_person_label(event_id, m.name)
@@ -410,6 +415,23 @@ class MonitorPipeline:
                     self._last_capture_age_s, self.limits.capture_age_fail_s,
                     self._last_captured_at.isoformat(timespec="seconds")
                     if self._last_captured_at else "desconhecido")
+            # Stream mudo: conectou mas NUNCA entregou frame — nada envelhece
+            # se nada chega, então o frescor nunca dispara (ponto cego real:
+            # 2026-11-09, 3h25 cego por "Camera not found in managers").
+            # Resync a cada tick + UM aviso ao usuário após 5min de silêncio.
+            if self._frames_seen == 0 and mono - self._boot_mono > 120:
+                logger.error("stream mudo: 0 frames em %.0fs desde a conexão — pedindo resync",
+                             mono - self._boot_mono)
+                self._resync_requested = True
+                if mono - self._boot_mono > 300 and not self._mute_notified:
+                    self._mute_notified = True
+                    try:
+                        from notifier import send_telegram
+                        await asyncio.to_thread(send_telegram,
+                            "⚠️ casa-monitor CEGO: o stream não entrega frames há "
+                            "mais de 5 min. Reinicie o Miloco (docker restart miloco).")
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
             logger.info(self._watchdog_line())
 
     async def _describe_event(self, event_id: int, event_type: str,
@@ -459,8 +481,9 @@ class MonitorPipeline:
 
         # identidade: parecia com alguém conhecido? (recorte da pessoa)
         try:
-            hist = await asyncio.to_thread(crop_hist, crop_path)
-            m = match(hist, self.store.known_people())
+            from events.identity import identify
+            m = await asyncio.to_thread(identify, crop_path,
+                                        self.store.known_people())
             if m.matched:
                 quem = f"{m.name} (conhecido, {m.score:.0%})"
                 self.store.set_event_person_label(event_id, m.name)
@@ -746,6 +769,28 @@ class MonitorPipeline:
                     logger.info("debug-person: track=%s center=(%.0f,%.0f) zone=%s",
                                 d.track_id, d.center[0], d.center[1],
                                 self.engine.zones.zone_at(*d.center))
+            # Projeto marcha: grava a SEQUÊNCIA de frames por track de pessoa
+            # (1 track = 1 cruzamento; junta-se às identidades pelos eventos
+            # "track<id>"). Máx 24 frames por track, ~3 frames/s.
+            if now - self._gait_last_save >= 0.35:
+                self._gait_last_save = now
+                for d in dets:
+                    if d.cls_name != "person" or not d.track_id:
+                        continue
+                    n = self._gait_seq.get(d.track_id, 0)
+                    if n >= 24:
+                        continue
+                    crop = env.frame.image[int(d.y1):int(d.y2),
+                                           int(d.x1):int(d.x2)]
+                    if crop.size < 4000:
+                        continue
+                    import cv2
+                    from pathlib import Path as _P
+                    day = datetime.now().strftime("%Y-%m-%d")
+                    out = _P("data/gait_sequences") / day
+                    out.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(out / f"t{d.track_id}_{n:03d}.jpg"), crop)
+                    self._gait_seq[d.track_id] = n + 1
             observed_at = datetime.fromtimestamp(env.frame.arrival_wall).astimezone()
             t_step = time.monotonic()
             ids = self.engine.step(env.frame.image, dets, time.monotonic(),

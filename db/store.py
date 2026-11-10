@@ -107,6 +107,7 @@ class Store:
             },
             "known_people": {
                 "signature_source": "TEXT NOT NULL DEFAULT 'full_frame'",
+                "face_emb": "BLOB",
             },
         }
         for table, columns in additions.items():
@@ -240,18 +241,19 @@ class Store:
     # ---------- pessoas conhecidas ----------
     def add_known_person(self, name: str, description: str, crop_path: str,
                          hist: bytes, source_event_id: Optional[int] = None,
-                         signature_source: str = "person_crop") -> int:
+                         signature_source: str = "person_crop",
+                         face_emb: Optional[bytes] = None) -> int:
         cur = self._conn.execute(
             "INSERT INTO known_people (name, description, crop_path, hist, source_event_id,"
-            " created_at, signature_source) VALUES (?,?,?,?,?,?,?)",
+            " created_at, signature_source, face_emb) VALUES (?,?,?,?,?,?,?,?)",
             (name, description, crop_path, hist.tobytes() if hasattr(hist, "tobytes") else hist,
-             source_event_id, _now_iso(), signature_source))
+             source_event_id, _now_iso(), signature_source, face_emb))
         self._conn.commit()
         return int(cur.lastrowid)
 
     def known_people(self) -> list[dict]:
         cur = self._conn.execute(
-            "SELECT id, name, description, crop_path, hist, source_event_id, created_at, signature_source"
+            "SELECT id, name, description, crop_path, hist, source_event_id, created_at, signature_source, face_emb"
             " FROM known_people ORDER BY name")
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
